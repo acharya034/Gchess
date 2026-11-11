@@ -97,6 +97,9 @@ struct NetGame {
     char status[16];
     char winner[8];
     bool wdraw, bdraw, wtake, btake, active;
+    bool gotFull, clocksKnown;   // gotFull: names/ratings were read once; clocksKnown: wtime/btime are real (stream mode only)
+    uint32_t nextPoll;           // polling mode: when this game is read next
+    uint16_t plies;              // number of half-moves seen (tells whose turn it is)
 };
 
 // Human readable names (same order as the enums above) - used only for the serial log.

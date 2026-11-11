@@ -23,82 +23,132 @@ static char gScopes[96] = "";            // permissions of the token, as reporte
 static char gKnown[24][14];             // game ids that existed before the user started a new game
 static uint8_t gKnownN = 0;
 static bool gOngoingFetched = false;
-// ---------------- minimal HTTPS client with streaming + chunked decoding + keep-alive ----------------
+
+// =====================================================================================================
+//  HTTPS client  (HTTP/1.1 keep-alive for requests, HTTP/1.0 for streams)
+//
+//  Two kinds of connections exist:
+//    hReq      one kept-alive socket used for EVERY request (moves, lists, polling). It stays open between
+//              requests, so a move only needs one round trip (no DNS, no TCP, no TLS handshake).
+//    hGameS[]  permanent game streams. Only used when GAME_LIVE_MODE = 1 (see gchess_config.h).
+//
+//  RAM: one open TLS socket costs ~45 KB and a new one needs ~75 KB free while it connects. An ESP32 without
+//  extra RAM can therefore NOT hold two sockets. In the default mode (GAME_LIVE_MODE 0) the game is read by
+//  polling over the same kept-alive socket, so there is only ever ONE socket and no out-of-memory error.
+// =====================================================================================================
 #define LINE_CAP 3072
+
 struct HttpStream {
     WiFiClientSecure cli;
-    bool chunked = false, ended = true;
+    bool chunked = false;
+    bool ended = true;          // the current response was read completely (or nothing is being read)
     bool srvClose = false;      // server sent "Connection: close"
-    bool keepAlive = false;     // this response was fully framed, socket can be reused
+    bool keepAlive = false;     // this response was fully framed, the socket can be reused
+    bool reusedSocket = false;  // the last request used an already open socket
     int status = 0;
-    uint8_t cs = 0;
-    uint8_t tl = 0;             // length of the current trailer line (chunked end)
+    uint8_t cs = 0;             // chunk decoder state
+    uint8_t tl = 0;             // length of the current trailer line (end of a chunked body)
     uint32_t chunkLeft = 0;
-    int32_t bodyLeft = -1;      // remaining Content-Length bytes, -1 = unknown (read until EOF)
+    int32_t bodyLeft = -1;      // remaining Content-Length bytes, -1 = unknown (read until the server closes)
+    uint32_t tConnect = 0;      // PERF: ms for DNS + TCP + TLS handshake (0 when the socket was reused)
+    uint32_t tSend = 0;         // PERF: ms to write the request
+    uint32_t tWait = 0;         // PERF: ms from "request sent" until the first answer line arrived
     char scopes[96] = "";       // value of the x-oauth-scopes header of the last answer
-    char* line = nullptr;
-    uint16_t ll = 0;            // allocated on first use (saves static RAM)
+    char* line = nullptr;       // line buffer for streams, allocated on first use (saves static RAM)
+    uint16_t ll = 0;
 
-    // End of response, but keep the TLS socket open for the next request.
+    // The answer was read completely, but keep the TLS socket open for the next request.
     void finish() {
         ended = true;
         ll = 0;
     }
-    // Really close the socket.
+
+    // Really close the socket (frees ~45 KB).
     void close() {
         cli.stop();
         ended = true;
         keepAlive = false;
         ll = 0;
     }
+
     bool alive() {
         return !ended && (cli.connected() || cli.available());
     }
 
-    // reuse = true: HTTP/1.1 keep-alive, the existing socket is reused if it is still connected.
-    // reuse = false: HTTP/1.0 + Connection: close, always a fresh connection (game streams).
-    bool open(const char* method, const char* path, const char* body = nullptr, const char* accept = "application/json", bool reuse = false) {
+    // Send a request and read the answer headers.
+    //   reuse = true  : HTTP/1.1 keep-alive. An open socket is reused, otherwise a new one is made.
+    //   reuse = false : HTTP/1.0 + "Connection: close", always a fresh socket (game streams).
+    // Returns false if the socket is dead or the answer never started (the caller reconnects and retries).
+    bool open(const char* method, const char* path, const char* body = nullptr, const char* accept = "application/json", bool reuse = false, const char* ctype = "application/x-www-form-urlencoded") {
         finish();
         keepAlive = false;
+        tConnect = tSend = tWait = 0;
+        reusedSocket = false;
 
+        // ---- 1. socket: reuse the open one or connect ----
+        uint32_t t0 = millis();
         if (reuse && cli.connected()) {
-            while (cli.available()) cli.read();   // drop stale leftovers of the previous response
-            DBG(HTTP, ">> reusing open TLS connection");
+            while (cli.available()) cli.read();      // drop stale leftovers of the previous answer
+            reusedSocket = true;
         } else {
             cli.stop();
-            cli.setInsecure();  // NOTE: add the Lichess root CA with cli.setCACert() for production
+            cli.setInsecure();                       // NOTE: use cli.setCACert() with the Lichess root certificate for production
             if (!cli.connect(LICHESS_HOST, 443)) {
                 DBG(HTTP, "!! TLS connect to %s failed (wifi=%d heap=%u)", LICHESS_HOST, (int)WiFi.status(), (unsigned)ESP.getFreeHeap());
                 return false;
             }
+            tConnect = millis() - t0;
         }
-        DBG(HTTP, ">> %s https://%s%s", method, LICHESS_HOST, path);
 
-        String req = String(method) + " " + path + (reuse ? " HTTP/1.1" : " HTTP/1.0") +
-                     "\r\nHost: " LICHESS_HOST "\r\nUser-Agent: Gchess/" GC_VERSION "\r\nAccept: " + accept + "\r\n";
-        if (gToken[0]) req += "Authorization: Bearer " + String(gToken) + "\r\n";
-        if (body) req += "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: " + String(strlen(body)) + "\r\n";
-        else if (!strcmp(method, "POST")) req += "Content-Length: 0\r\n";
-        req += reuse ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
-        if (body) req += body;
-        DBG(HTTP, ">> headers: Accept: %s | Authorization: Bearer %s | Content-Length: %d", accept, gToken[0] ? dbgSecret(gToken) : "(none)", body ? (int)strlen(body) : 0);
+        // ---- 2. build the request header in a stack buffer (no heap allocations, no fragmentation) ----
+        char req[768];
+        size_t blen = body ? strlen(body) : 0;
+        int n = snprintf(req, sizeof(req), "%s %s %s\r\nHost: %s\r\nUser-Agent: Gchess/%s\r\nAccept: %s\r\n", method, path, reuse ? "HTTP/1.1" : "HTTP/1.0", LICHESS_HOST, GC_VERSION, accept);
+        if (gToken[0] && n > 0 && n < (int)sizeof(req)) n += snprintf(req + n, sizeof(req) - n, "Authorization: Bearer %s\r\n", gToken);
+        if (n > 0 && n < (int)sizeof(req)) {
+            if (body) n += snprintf(req + n, sizeof(req) - n, "Content-Type: %s\r\nContent-Length: %u\r\n", ctype, (unsigned)blen);
+            else if (!strcmp(method, "POST")) n += snprintf(req + n, sizeof(req) - n, "Content-Length: 0\r\n");
+        }
+        if (n > 0 && n < (int)sizeof(req)) n += snprintf(req + n, sizeof(req) - n, "Connection: %s\r\n\r\n", reuse ? "keep-alive" : "close");
+        if (n <= 0 || n >= (int)sizeof(req)) {
+            DBG(HTTP, "!! request header too long (%d bytes)", n);
+            return false;
+        }
+        DBG(HTTP, ">> %s https://%s%s %s", method, LICHESS_HOST, path, reusedSocket ? "(reused socket)" : "(new socket)");
+        DBG(HTTP, ">> headers: Accept: %s | Authorization: Bearer %s | Content-Length: %u", accept, gToken[0] ? dbgSecret(gToken) : "(none)", (unsigned)blen);
         if (body) DBG(HTTP, ">> body: %s", body);
-        cli.print(req);
 
+        // ---- 3. send ----
+        uint32_t t1 = millis();
+        size_t sent = cli.write((const uint8_t*)req, n);
+        if (sent == (size_t)n && blen) sent = cli.write((const uint8_t*)body, blen) + n;   // body after the header
+        if (sent < (size_t)n + blen) {
+            DBG(HTTP, "!! write failed (socket dead?)");
+            return false;                                         // the caller reconnects
+        }
+        tSend = millis() - t1;
+
+        // ---- 4. read the answer header ----
         status = 0;
         chunked = false;
         srvClose = false;
         int32_t contentLen = -1;
-        uint32_t t0 = millis();
-        while (millis() - t0 < 10000) {
-            if (!cli.connected() && !cli.available()) return false;   // dead socket -> caller reconnects
+        bool first = true;
+        uint32_t t2 = millis();
+        uint32_t headerTimeout = reusedSocket ? 4000 : 10000;       // a reused socket that stays silent is probably dead
+        while (millis() - t2 < headerTimeout) {
+            if (!cli.connected() && !cli.available()) return false;     // server closed the socket -> caller reconnects
             if (!cli.available()) {
-                delay(5);
+                delay(2);
                 continue;
             }
             String h = cli.readStringUntil('\n');
+            if (first) {
+                tWait = millis() - t2;
+                first = false;
+            }
             h.trim();
-            if (!h.length()) break;
+            if (!h.length()) break;                                      // empty line = end of the header
             DBG(HTTP, "<< %s", h.c_str());
             String hl = h;
             hl.toLowerCase();
@@ -108,20 +158,23 @@ struct HttpStream {
             else if (hl.startsWith("content-length:")) contentLen = hl.substring(15).toInt();
             else if (hl.startsWith("connection:") && hl.indexOf("close") > 0) srvClose = true;
         }
+
+        // ---- 5. how will the body end? ----
         cs = 0;
         tl = 0;
         chunkLeft = 0;
         ll = 0;
         ended = false;
         bodyLeft = chunked ? -1 : contentLen;
-        if (status == 204 || status == 304 || (!chunked && contentLen == 0)) ended = true;   // no body at all
-        keepAlive = reuse && !srvClose && (chunked || contentLen >= 0 || ended);
+        if (status == 204 || status == 304 || (!chunked && contentLen == 0)) ended = true;     // no body at all
+        keepAlive = reuse && !srvClose && (chunked || contentLen >= 0 || ended);               // we know where the body ends
         return status > 0;
     }
 
+    // One byte of the body, or -1 if nothing is available right now / the body is complete.
     int getByte() {
         if (ended) return -1;
-        if (!chunked && bodyLeft == 0) {          // Content-Length reached: response complete
+        if (!chunked && bodyLeft == 0) {            // Content-Length reached: answer complete
             ended = true;
             return -1;
         }
@@ -134,11 +187,12 @@ struct HttpStream {
                 return c;
             }
             switch (cs) {
-                case 0:                           // chunk size line
+                case 0:                             // chunk size line (hex digits)
                     if (c == '\r') {
+                        // ignore
                     } else if (c == '\n') {
                         if (chunkLeft == 0) {
-                            cs = 3;               // last chunk: now consume the trailer
+                            cs = 3;                 // last chunk: consume the trailer now
                             tl = 0;
                         } else {
                             cs = 1;
@@ -148,16 +202,16 @@ struct HttpStream {
                         if (d >= 0) chunkLeft = chunkLeft * 16 + d;
                     }
                     break;
-                case 1:                           // chunk data
+                case 1:                             // chunk data
                     if (--chunkLeft == 0) cs = 2;
                     return c;
-                case 2:                           // CRLF after chunk data
+                case 2:                             // CRLF after the chunk data
                     if (c == '\n') {
                         cs = 0;
                         chunkLeft = 0;
                     }
                     break;
-                case 3:                           // trailer lines, an empty line ends the response
+                case 3:                             // trailer lines; an empty line ends the answer
                     if (c == '\n') {
                         if (tl == 0) {
                             ended = true;
@@ -174,7 +228,7 @@ struct HttpStream {
         }
     }
 
-    // 1 = a full line copied to out, 0 = nothing yet, -1 = stream closed
+    // For streams: 1 = a full line copied to out, 0 = nothing yet, -1 = stream closed.
     int pollLine(char* out, size_t cap) {
         if (!line) {
             line = (char*)malloc(LINE_CAP);
@@ -197,23 +251,23 @@ struct HttpStream {
         return 0;
     }
 };
-static HttpStream hGameS[2], hReq;   // live game stream(s) + one-shot requests (there is no events stream any more)
+
+static HttpStream hGameS[2];                  // game streams (only used when GAME_LIVE_MODE = 1)
+static HttpStream hReq;                       // the kept-alive request socket
 static uint32_t gStreamRetryAt[2] = {0, 0};   // when a dropped / paused game stream may reconnect
 static uint8_t gPausedMask = 0;               // bit n = game stream n was paused to make room for a request
+static uint32_t gLastReqEnd = 0;              // when the last request finished (for the idle timeout)
 
-// (tlsMakeRoom and tlsResume stay exactly as they are)
-// After the request: let paused streams reconnect (the new "gameFull" line brings everything up to date).
-static void tlsResume() {
-    for (int i = 0; i < 2; i++) {
-        if (gPausedMask & (1 << i)) {
-            gPausedMask &= ~(1 << i);
-            gStreamRetryAt[i] = millis() + 150;
-        }
-    }
+// Is any online game being followed right now?
+static bool anyGameActive() {
+    for (int i = 0; i < 2; i++) if (gNetG[i].active) return true;
+    return false;
 }
 
-// Give TLS room to connect: pause the live game stream(s). They reconnect by themselves (tlsResume).
+// STREAM MODE only: make room for a NEW TLS connection by pausing the game stream(s).
+// They reconnect by themselves (tlsResume).
 static void tlsMakeRoom(bool force) {
+    if (GAME_LIVE_MODE == 0) return;                          // polling mode: there are no streams to pause
     if (!force && ESP.getFreeHeap() >= TLS_MIN_FREE_HEAP) return;
     for (int i = 0; i < 2; i++) {
         if (hGameS[i].alive() && i != gSeekSlot) {
@@ -224,46 +278,75 @@ static void tlsMakeRoom(bool force) {
     }
 }
 
-// One complete HTTPS request over the kept-alive connection. Returns the status code; the body goes into "out".
-static int httpReq(const char* method, const char* path, const char* body, String& out, const char* accept = "application/json", size_t cap = 24000) {
-    out = "";
+// STREAM MODE only: before a stream connects, drop the idle request socket if RAM is short.
+static void tlsReleaseRequestSocket() {
+    if (GAME_LIVE_MODE == 0) return;
+    if (hReq.cli.connected() && ESP.getFreeHeap() < TLS_MIN_FREE_HEAP) {
+        DBG(NET, "closing the request socket so a stream can connect (free=%u)", (unsigned)ESP.getFreeHeap());
+        hReq.close();
+    }
+}
 
-    // The TLS buffers are already allocated if the socket is still open, so only make room for a new handshake.
+// After a request: let paused streams reconnect (their first line brings the game up to date again).
+static void tlsResume() {
+    for (int i = 0; i < 2; i++) {
+        if (gPausedMask & (1 << i)) {
+            gPausedMask &= ~(1 << i);
+            gStreamRetryAt[i] = millis() + 150;
+        }
+    }
+}
+
+// One complete HTTPS request over the kept-alive socket. Returns the status code (or -1); the body goes into "out".
+// Safe because only the network task calls it (one request at a time).
+static int httpReq(const char* method, const char* path, const char* body, String& out, const char* accept = "application/json", size_t cap = 24000, const char* ctype = "application/x-www-form-urlencoded") {
+    out = "";
+    uint32_t tStart = millis();
+
+    // RAM is only needed for a NEW connection; an open socket already owns its buffers.
     if (!hReq.cli.connected()) tlsMakeRoom(false);
 
-    bool ok = hReq.open(method, path, body, accept, true);
-    if (!ok) {                                            // stale socket (server idle-closed it) or no RAM
-        hReq.close();                                     // frees the old TLS session
+    bool ok = hReq.open(method, path, body, accept, true, ctype);
+    if (!ok) {                                 // dead socket (server closed it while idle) or no RAM: reconnect once
+        DBG(HTTP, "request failed, reconnecting once");
+        hReq.close();                          // frees the old TLS session
         tlsMakeRoom(false);
-        ok = hReq.open(method, path, body, accept, true);
+        ok = hReq.open(method, path, body, accept, true, ctype);
     }
-    if (!ok) {                                            // still out of memory? pause the game streams
+    if (!ok) {                                 // still no luck: pause streams (stream mode) and try a last time
         hReq.close();
         tlsMakeRoom(true);
-        ok = hReq.open(method, path, body, accept, true);
+        ok = hReq.open(method, path, body, accept, true, ctype);
     }
     if (!ok) {
         hReq.close();
         tlsResume();
+        DBG(HTTP, "!! %s %s failed after %lums", method, path, (unsigned long)(millis() - tStart));
         return -1;
     }
 
-    uint32_t t0 = millis();
-    while (millis() - t0 < 15000) {
+    // read the body
+    uint32_t tBody = millis();
+    while (millis() - tBody < 15000) {
         int c = hReq.getByte();
         if (c >= 0) {
             if (out.length() < cap) out += (char)c;
             continue;
         }
         if (hReq.ended || (!hReq.cli.connected() && !hReq.cli.available())) break;
-        delay(2);
+        delay(1);
     }
 
     int st = hReq.status;
-    if (hReq.ended && hReq.keepAlive) hReq.finish();      // fully read: keep the TLS socket for the next request
-    else hReq.close();                                    // timeout / truncated / server said close
+    bool complete = hReq.ended && hReq.keepAlive;
+    bool keep = complete && ESP.getFreeHeap() >= KEEPALIVE_MIN_FREE;     // too little RAM left? do not keep the socket
+    if (keep) hReq.finish();                   // keep the TLS socket for the next request
+    else hReq.close();                         // timeout / truncated / server said close / no RAM
+    gLastReqEnd = millis();
+
     DBG(HTTP, "<< status %d, body %d bytes: %.300s", st, (int)out.length(), out.c_str());
-   tlsResume();
+    DBG(NET, "PERF %s %s: %s connect=%lums send=%lums wait=%lums body=%lums TOTAL=%lums keep=%d free=%u", method, path, hReq.reusedSocket ? "reused" : "new", (unsigned long)hReq.tConnect, (unsigned long)hReq.tSend, (unsigned long)hReq.tWait, (unsigned long)(millis() - tBody), (unsigned long)(millis() - tStart), (int)keep, (unsigned)ESP.getFreeHeap());
+    tlsResume();
     return st;
 }
 
@@ -344,6 +427,7 @@ static void gameApplyState(NetGame& g, JsonObjectConst s) {
     g.wtime = s["wtime"] | 0;
     g.btime = s["btime"] | 0;
     g.stamp = millis();
+    g.clocksKnown = true;                // (stream mode only: the stream carries the clocks)
     strlcpy(g.status, s["status"] | "started", sizeof(g.status));
     strlcpy(g.winner, s["winner"] | "", sizeof(g.winner));
     g.wdraw = s["wdraw"] | false;
@@ -420,20 +504,144 @@ static void startGame(const char* id, bool white, const char* opp, int oppRating
     gNetG[s].active = true;
     strcpy(gNetG[s].initialFen, "startpos");
     xSemaphoreGive(gNetMux);
-    char path[64];
-    snprintf(path, sizeof(path), "/api/board/game/stream/%s", id);
-    if (!hGameS[s].open("GET", path, nullptr, "application/x-ndjson") || hGameS[s].status != 200) {
-        uiPost(UE_TOAST, "Could not open game");
-        gNetG[s].active = false;
-        return;
+    if (GAME_LIVE_MODE) {
+        // STREAM MODE: a permanent game stream (needs a second TLS socket: free the request socket first if RAM is short)
+        tlsReleaseRequestSocket();
+        char path[64];
+        snprintf(path, sizeof(path), "/api/board/game/stream/%s", id);
+        if (!hGameS[s].open("GET", path, nullptr, "application/x-ndjson") || hGameS[s].status != 200) {
+            uiPost(UE_TOAST, "Could not open game");
+            gNetG[s].active = false;
+            return;
+        }
+    } else {
+        // POLLING MODE: nothing to open. pollGameState() reads the game over the kept-alive request socket.
+        gNetG[s].nextPoll = millis() + 150;
     }
     uiPost(UE_GAME_START, opp, id, (white ? 1 : 0) | (s << 1), oppRating);
+}
+
+// ---------------- polling mode: follow a game over the kept-alive socket ----------------
+
+// Lichess sends the moves in SAN ("e4 e5 Nf3"); the game logic uses UCI ("e2e4 e7e5 g1f3").
+// Returns false if a move cannot be read. pliesOut = number of half-moves.
+static bool sanToUciList(const char* san, char* out, size_t cap, uint16_t* pliesOut) {
+    cr::Position p;
+    cr::setStart(p);
+    size_t k = 0;
+    uint16_t plies = 0;
+    out[0] = 0;
+    char tok[16];
+    const char* c = san;
+    while (*c) {
+        while (*c == ' ' || *c == '\n') c++;
+        if (!*c) break;
+        int t = 0;
+        while (*c && *c != ' ' && *c != '\n' && t < 15) tok[t++] = *c++;
+        tok[t] = 0;
+        if (isdigit((unsigned char)tok[0]) && (strchr(tok, '.') || strchr(tok, '-'))) continue;   // move numbers and results
+        cr::Move m;
+        if (!cr::fromSan(p, tok, &m)) return false;
+        char u[8];
+        cr::toUci(m, u);
+        size_t l = strlen(u);
+        if (k + l + 2 >= cap) return false;
+        if (k) out[k++] = ' ';
+        memcpy(out + k, u, l);
+        k += l;
+        out[k] = 0;
+        cr::makeMove(p, m);
+        plies++;
+    }
+    *pliesOut = plies;
+    return true;
+}
+
+// Read one game (moves, status, winner, names on the first call) and tell the UI if something changed.
+// The next read is scheduled: fast while the opponent must move, slower while it is my move.
+static void pollGameState(int slot) {
+    NetGame& g = gNetG[slot];
+    char path[112];
+    snprintf(path, sizeof(path), "/game/export/%s?moves=true&tags=false&clocks=false&evals=false&opening=false", g.id);
+
+    String o;
+    int st = httpReq("GET", path, nullptr, o, "application/json", 8000);
+    if (st != 200) {
+        g.nextPoll = millis() + 3000;                       // network problem or game not found: try again later
+        DBG(NET, "poll game %s failed (HTTP %d)", g.id, st);
+        return;
+    }
+
+    JsonDocument filter;                                    // keep only what we need
+    filter["status"] = true;
+    filter["winner"] = true;
+    filter["moves"] = true;
+    for (int side = 0; side < 2; side++) {
+        JsonObject f = filter["players"][side ? "black" : "white"].to<JsonObject>();
+        f["user"]["name"] = true;
+        f["rating"] = true;
+        f["aiLevel"] = true;
+    }
+    JsonDocument d;
+    DeserializationError err = deserializeJson(d, o, DeserializationOption::Filter(filter));
+    o = "";                                                 // free the raw answer early
+    if (err) {
+        g.nextPoll = millis() + 3000;
+        DBG(NET, "poll game %s: JSON error %s", g.id, err.c_str());
+        return;
+    }
+
+    char uci[2400];
+    uint16_t plies = 0;
+    if (!sanToUciList(d["moves"] | "", uci, sizeof(uci), &plies)) {
+        g.nextPoll = millis() + 3000;
+        DBG(NET, "poll game %s: could not read the move list", g.id);
+        return;
+    }
+
+    char status[16], winner[8];
+    xSemaphoreTake(gNetMux, portMAX_DELAY);
+    bool first = !g.gotFull;
+    bool changed = first || strcmp(g.moves, uci) != 0;
+    if (first) {                                            // names and ratings only need to be read once
+        for (int side = 0; side < 2; side++) {
+            JsonObjectConst p = d["players"][side ? "black" : "white"].as<JsonObjectConst>();
+            char* dst = side ? g.black : g.white;
+            if (p["aiLevel"].is<int>()) snprintf(dst, 26, "Stockfish L%d", (int)p["aiLevel"]);
+            else strlcpy(dst, p["user"]["name"] | "Anonymous", 26);
+            (side ? g.bRating : g.wRating) = p["rating"] | 0;
+        }
+        strcpy(g.initialFen, "startpos");
+        g.gotFull = true;
+    }
+    strlcpy(g.moves, uci, sizeof(g.moves));
+    strlcpy(g.status, d["status"] | "started", sizeof(g.status));
+    strlcpy(g.winner, d["winner"] | "", sizeof(g.winner));
+    g.wtime = g.btime = 0;                                  // the export has no running clocks
+    g.clocksKnown = false;
+    g.stamp = millis();
+    g.plies = plies;
+    bool over = strcmp(g.status, "created") && strcmp(g.status, "started");
+    if (over) g.active = false;
+    strlcpy(status, g.status, sizeof(status));
+    strlcpy(winner, g.winner, sizeof(winner));
+    xSemaphoreGive(gNetMux);
+
+    if (changed || over) uiPost(UE_GAME_UPDATE, "", "", first ? 1 : 0, slot);
+    if (over) {
+        uiPost(UE_GAME_END, status, winner, slot);
+        return;
+    }
+    bool whiteToMove = (plies % 2) == 0;
+    bool myTurn = (whiteToMove == g.iAmWhite);
+    g.nextPoll = millis() + (myTurn ? POLL_GAME_MY_MS : POLL_GAME_OPP_MS);
 }
 
 static void fetchOngoing(bool lookForNew = false);
 
 // Read the live game stream(s) without waiting; reconnect them when they dropped or were paused.
 static void pollStreams() {
+    if (GAME_LIVE_MODE == 0) return;     // polling mode: there are no streams
     static char buf[3072];
     int r;
     for (int i = 0; i < 2; i++) {
@@ -555,6 +763,7 @@ static bool puzzleStorePop(char* out, size_t cap) {
 
 // Download several puzzles for offline play.
 static void puzzleBatch(int count) {
+    if (count > 5) count = 5;            // keep the answer small: the request socket is open and RAM is limited
     if (!strstr(gScopes, "puzzle:read")) {
         uiPost(UE_TOAST, "Token needs puzzle:read", "Offline puzzles need the permission puzzle:read. Link the account again and allow it.");
         return;
@@ -567,7 +776,7 @@ static void puzzleBatch(int count) {
     filter["puzzles"][0]["puzzle"]["solution"] = true;
     char path[64];
     snprintf(path, sizeof(path), "/api/puzzle/batch/mix?nb=%d", count);
-    int st = httpReq("GET", path, nullptr, o, "application/json", 60000);
+    int st = httpReq("GET", path, nullptr, o, "application/json", 36000);
     if (st != 200) {
         uiPost(UE_TOAST, st == 401 || st == 403 ? "Token lacks puzzle:read" : "Puzzle download failed");
         return;
@@ -1090,6 +1299,7 @@ static void handleCmd(NetCmd& c) {
         break;
         case NC_LOGOUT: gLoggedIn = false;
         gToken[0] = 0;
+        hReq.close();
         hGameS[0].close();
         hGameS[1].close();
         for (int i = 0; i < 2; i++) gNetG[i].active = false;
@@ -1133,8 +1343,12 @@ static void handleCmd(NetCmd& c) {
         break;
         case NC_MOVE: snprintf(path, sizeof(path), "/api/board/game/%s/move/%s", c.s2, c.s1);
         {
+            uint32_t t0 = millis();
             int st = httpReq("POST", path, nullptr, o);
+            DBG(NET, "PERF move %s submitted in %lu ms (HTTP %d)", c.s1, (unsigned long)(millis() - t0), st);
             if (st != 200) netFail("Move rejected by server", st, o);
+            int sl = slotFor(c.s2);
+            if (sl >= 0) gNetG[sl].nextPoll = millis() + 350;      // read the game again soon: the computer may answer at once
         } break;
         case NC_RESIGN: postSimple("/api/board/game/%s/resign", c.s2);
         break;
@@ -1212,7 +1426,7 @@ static void netTask(void*) {
         if (gLoggedIn && !gNeedAccount && WiFi.status() == WL_CONNECTED) {
             static uint32_t tChallenges = 0, tList = 0, tNew = 0;
             uint32_t now = millis();
-            bool live = hGameS[0].alive() || hGameS[1].alive();       // a live stream is open: do not disturb it
+            bool live = GAME_LIVE_MODE ? (hGameS[0].alive() || hGameS[1].alive()) : anyGameActive();   // a game is being followed: no extra traffic
             bool expecting = now < gExpectUntil && gSeekSlot < 0;      // the user waits for a game to start
             if (expecting && (gPollNow || now - tNew > POLL_NEWGAME_MS)) {
                 gPollNow = false;
@@ -1227,6 +1441,31 @@ static void netTask(void*) {
                     tChallenges = now;
                     pollChallenges();
                 }
+            }
+        }
+        // Polling mode: read the followed games over the kept-alive socket (at most one request per loop).
+        if (GAME_LIVE_MODE == 0 && WiFi.status() == WL_CONNECTED) {
+            for (int i = 0; i < 2; i++) {
+                if (gNetG[i].active && millis() >= gNetG[i].nextPoll) {
+                    pollGameState(i);
+                    break;
+                }
+            }
+        }
+        // Every 15 s: stack of this task (if it gets close to 0, raise the size in netBegin)
+        static uint32_t tStack = 0;
+        if (millis() - tStack > 15000) {
+            tStack = millis();
+            DBG(SYS, "net task stack left: %u bytes, free heap %u, request socket %s", (unsigned)uxTaskGetStackHighWaterMark(nullptr), (unsigned)ESP.getFreeHeap(), hReq.cli.connected() ? "open" : "closed");
+        }
+        // Housekeeping of the kept-alive socket
+        if (hReq.cli.connected()) {
+            if (WiFi.status() != WL_CONNECTED) {
+                hReq.close();                                    // Wi-Fi lost: the socket is dead anyway, reconnect later
+                DBG(NET, "Wi-Fi lost: request socket closed");
+            } else if (!anyGameActive() && millis() - gLastReqEnd > HTTP_KEEPALIVE_IDLE_MS) {
+                hReq.close();                                    // idle: give the ~45 KB back
+                DBG(NET, "request socket idle for %d s: closed (free=%u)", HTTP_KEEPALIVE_IDLE_MS / 1000, (unsigned)ESP.getFreeHeap());
             }
         }
         pollStreams();

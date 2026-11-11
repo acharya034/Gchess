@@ -2,80 +2,98 @@
 //  board.h  -  reads the 64 hall sensors (4 x 4 x 4 matrix, 12 pins)
 //
 //  Every sensor has 3 wires:
-//     VCC  -> positive line i  (switched by a PNP transistor, pin LOW = on)
+//     VCC  -> positive line i  (switched by a PNP transistor, pin HIGH = on via NPN driver)
 //     GND  -> negative line j  (switched by an NPN transistor, pin HIGH = on)
-//     OUT  -> data line k      (read directly, 10k pull-up to 3V3)
-//  So sensor (k,i,j) only works while positive line i AND negative line j are on.
+//     OUT  -> data line k      (read directly, pull-up to 3V3)
 //
 //  Public API:
 //     boardBegin()          set the pins up (call once)
-//     boardScan()           call very often (hardware task); debounces the result
+//     boardScan()           call from the hardware task; scans ONE line per call
 //     boardOccupancy()      64 bit mask, bit n = a magnet is on square n (a1 = bit 0)
+//     boardRawChanged()     true once after the occupancy changed
+//     boardReadRaw()        blocking full scan (only for test pages, not for hwTask)
 // =====================================================================================
 #pragma once
 #include "gchess_config.h"
 #include "debug.h"
-#include "leds.h"   // hwToSq(): converts (row, column) on the board to a chess square
+#include "leds.h"   // hwToSq()
 
-// Shared result of the scanner. A tiny "sequence lock" lets the UI task read the 64 bit
-// value without a mutex (it retries if the scanner was writing at that moment).
-static volatile uint32_t occLo = 0, occHi = 0, occSeq = 0;
-static uint64_t rawLast = 0;      // result of the previous scan
-static uint8_t rawStable = 0;     // how many scans in a row gave the same result
-static uint32_t scanLast = 0;     // time of the last scan
+static portMUX_TYPE occMux = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t occ64 = 0;            // published stable result (guarded by occMux)
+static uint64_t rawBuild = 0;         // frame being assembled
+static uint64_t rawLast = 0;          // previous complete frame
+static uint8_t  rawStable = 0;        // identical frames in a row
+static uint8_t  scanRow = 0;          // which positive line the next call scans (0..3)
+static uint32_t scanLast = 0;         // start time of the last frame
 static volatile bool occChanged = false;
 
-// Convert "data line k, positive line i, negative line j" into a chess square (0..63).
+// data line k, positive line i, negative line j  ->  chess square (0..63)
 inline int sensorToSquare(int k, int i, int j) {
-  int row = SENSOR_ROW(k, i, j);   // 0 = top row of the board (as the user sees it)
-  int col = SENSOR_COL(k, i, j);   // 0 = left column
+  int row = SENSOR_ROW(k, i, j);
+  int col = SENSOR_COL(k, i, j);
   return hwToSq(row, col);
 }
 
-// Put every line in the OFF state: positive lines HIGH (PNP off), negative lines LOW (NPN off).
+// All lines OFF: positive and negative pins LOW.
 inline void boardBegin() {
   for (int n = 0; n < 4; n++) {
     pinMode(hallpin[0][n], OUTPUT);
-    digitalWrite(hallpin[0][n], HIGH);
+    digitalWrite(hallpin[0][n], LOW);
     pinMode(hallpin[1][n], OUTPUT);
     digitalWrite(hallpin[1][n], LOW);
-    pinMode(hallpin[2][n], INPUT);   // GPIO 34/35/36/39 have no internal pull-up -> external 10k
+    pinMode(hallpin[2][n], INPUT);
   }
-  DBG(SENS, "hall matrix ready: pos=%d,%d,%d,%d neg=%d,%d,%d,%d data=%d,%d,%d,%d", hallpin[0][0], hallpin[0][1], hallpin[0][2], hallpin[0][3], hallpin[1][0], hallpin[1][1], hallpin[1][2], hallpin[1][3], hallpin[2][0], hallpin[2][1], hallpin[2][2], hallpin[2][3]);
+  scanRow = 0;
+  rawBuild = 0;
+  DBG(SENS, "hall matrix ready");
 }
 
-// One complete raw scan of all 64 sensors. Takes about 1 ms.
-inline uint64_t boardReadRaw() {
+// Scan ONE positive line i (4 negative lines x settle time, well under 1 ms).
+// Returns the 64-bit contribution of that line.
+inline uint64_t boardScanLine(int i) {
   uint64_t occ = 0;
+  digitalWrite(hallpin[0][i], HIGH);                  // row i gets power
 
-  for (int i = 0; i < 4; i++) {                     // positive line i
-    digitalWrite(hallpin[0][i], LOW);               // PNP on: row i gets power
+  for (int j = 0; j < 4; j++) {
+    digitalWrite(hallpin[1][j], HIGH);                // column j gets ground
+    delayMicroseconds(HALL_SETTLE_US);
 
-    for (int j = 0; j < 4; j++) {                   // negative line j
-      digitalWrite(hallpin[1][j], HIGH);            // NPN on: column j gets ground
-      delayMicroseconds(HALL_SETTLE_US);            // let the sensors wake up
-
-      for (int k = 0; k < 4; k++) {                 // read the 4 data lines together
-        bool magnet = digitalRead(hallpin[2][k]) == (HALL_ACTIVE_LOW ? LOW : HIGH);
-        if (magnet) occ |= 1ULL << sensorToSquare(k, i, j);
-      }
-
-      digitalWrite(hallpin[1][j], LOW);             // column j off again
+    for (int k = 0; k < 4; k++) {
+      bool magnet = digitalRead(hallpin[2][k]) == (HALL_ACTIVE_LOW ? LOW : HIGH);
+      if (magnet) occ |= 1ULL << sensorToSquare(k, i, j);
     }
 
-    digitalWrite(hallpin[0][i], HIGH);              // row i off again
+    digitalWrite(hallpin[1][j], LOW);
   }
+
+  digitalWrite(hallpin[0][i], LOW);
   return occ;
 }
 
-// Called from the hardware task all the time. Publishes a new value only after the
-// same result was seen SENSOR_DEBOUNCE times in a row (ignores flicker while a piece slides).
+// Blocking full scan (4 lines). Do NOT call this from hwTask.
+inline uint64_t boardReadRaw() {
+  uint64_t occ = 0;
+  for (int i = 0; i < 4; i++) occ |= boardScanLine(i);
+  return occ;
+}
+
+// Called from the hardware task. Each call scans one line; after 4 calls a frame is
+// complete, debounced and published.
 inline void boardScan() {
   uint32_t now = millis();
-  if (now - scanLast < SENSOR_SCAN_MS) return;
-  scanLast = now;
 
-  uint64_t raw = boardReadRaw();
+  if (scanRow == 0) {
+    if (now - scanLast < SENSOR_SCAN_MS) return;      // wait between frames
+    scanLast = now;
+    rawBuild = 0;
+  }
+
+  rawBuild |= boardScanLine(scanRow);
+  scanRow++;
+  if (scanRow < 4) return;                            // frame not finished yet
+  scanRow = 0;
+
+  uint64_t raw = rawBuild;
   if (raw == rawLast) {
     if (rawStable < 255) rawStable++;
   } else {
@@ -84,36 +102,35 @@ inline void boardScan() {
   }
 
   if (rawStable == SENSOR_DEBOUNCE) {
-    uint32_t lo = (uint32_t)raw, hi = (uint32_t)(raw >> 32);
-    if (lo != occLo || hi != occHi) {
-      uint64_t before = ((uint64_t)occHi << 32) | occLo;
-      occSeq++;            // odd number = "writing"
-      occLo = lo;
-      occHi = hi;
-      occSeq++;            // even number = "done"
+    uint64_t before;
+    portENTER_CRITICAL(&occMux);
+    before = occ64;
+    portEXIT_CRITICAL(&occMux);
+
+    if (raw != before) {
+      portENTER_CRITICAL(&occMux);
+      occ64 = raw;
+      portEXIT_CRITICAL(&occMux);
       occChanged = true;
 
-      char added[48], removed[48];
+      static char added[48], removed[48];             // static: keep them off the task stack
       dbgSquares(raw & ~before, added, sizeof(added));
       dbgSquares(before & ~raw, removed, sizeof(removed));
-      DBG(SENS, "occupancy %016llx  pieces=%d  +[%s] -[%s]", (unsigned long long)raw, __builtin_popcountll(raw), added, removed);
+      DBG(SENS, "occupancy %016llx  pieces=%d  +[%s] -[%s]",
+          (unsigned long long)raw, __builtin_popcountll(raw), added, removed);
     }
   }
 }
 
-// Latest stable result (safe to call from the UI task).
+// Latest stable result (safe from any task).
 inline uint64_t boardOccupancy() {
-  uint32_t s1, s2, lo, hi;
-  do {
-    s1 = occSeq;
-    lo = occLo;
-    hi = occHi;
-    s2 = occSeq;
-  } while (s1 != s2 || (s1 & 1));
-  return ((uint64_t)hi << 32) | lo;
+  portENTER_CRITICAL(&occMux);
+  uint64_t v = occ64;
+  portEXIT_CRITICAL(&occMux);
+  return v;
 }
 
-// true once after the occupancy changed (used by the board test page)
+// true once after the occupancy changed
 inline bool boardRawChanged() {
   bool c = occChanged;
   occChanged = false;

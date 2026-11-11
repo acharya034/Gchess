@@ -69,6 +69,15 @@ QR code = `LINK_SITE_URL?d=<board ip>`. The website calls `POST /pair/start` (op
 `POST /pair/token {accessToken}` on the board. The board checks the token with Lichess and saves it.
 The window is only open while the Link page is on screen (5 minutes).
 
+## How the board talks to Lichess (memory!)
+One open TLS connection costs ~45 KB of RAM and a new one needs ~75 KB free while it connects, so an ESP32
+without extra RAM can hold only ONE. `GAME_LIVE_MODE` in `gchess_config.h` chooses:
+- `0` (default) polling: one kept-alive HTTPS connection does everything. A move needs one round trip
+  (serial log line `PERF move ...`). The game is read every 1 s (opponent to move) / 3 s (my move).
+  Not available in this mode: running clocks and the opponent's draw / takeback offers.
+- `1` stream: permanent game stream + request connection (two sockets, needs ~90 KB free RAM).
+Serial lines starting with `PERF` show connect / send / wait / body / total time of every request.
+
 ## Things still to know
 - Pieces/logos are drawn with shapes (`gfxPiece`). Tokens and passcodes are stored in plain flash.
 - TLS uses `setInsecure()`; add the Lichess root certificate before sharing the board.

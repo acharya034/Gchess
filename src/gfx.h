@@ -33,12 +33,12 @@ class LGFX : public lgfx::LGFX_Device {
     lgfx::Bus_SPI _bus;
     lgfx::Light_PWM _light;
     lgfx::Touch_XPT2046 _touch;
-    public: LGFX() {
+    public: LGFX() { 
         {
             auto c = _bus.config();
             c.spi_host = SPI3_HOST;
             c.spi_mode = 0;
-            c.freq_write = 40000000;
+            c.freq_write = 25000000;
             c.freq_read = 16000000;
             c.spi_3wire = false;
             c.use_lock = true;

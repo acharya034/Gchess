@@ -112,7 +112,7 @@ void setup() {
   gPages[PG_INTRO].draw();
 
   netBegin();                                                          // core 1
-  xTaskCreatePinnedToCore(hwTask, "hw", 3072, nullptr, 4, nullptr, 0); // core 0, high priority
+  xTaskCreatePinnedToCore(hwTask, "hw", 4096, nullptr, 4, nullptr, 0); // core 0, high priority
   xTaskCreatePinnedToCore(uiTask, "ui", 8192, nullptr, 3, nullptr, 0);
   dbgHeap("after start");
 }

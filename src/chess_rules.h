@@ -439,22 +439,76 @@ namespace cr {
         }
     }
     // Standard notation -> legal move.
+    // Fast version: reads the text (piece, destination, optional file/rank hint, promotion) and compares it
+    // with the legal moves. Only ONE move list is generated per call (the old way generated one per candidate).
     inline bool fromSan(const Position& p, const char* san, Move* out) {
-        char clean[16];
-        int k = 0;
-        for (const char* c = san; *c && k < 14; c++) if (*c != '+' && *c != '#' && *c != '!' && *c != '?') clean[k++] = *c;
-        clean[k] = 0;
-        if (!strcmp(clean, "0-0")) strcpy(clean, "O-O");
-        else if (!strcmp(clean, "0-0-0")) strcpy(clean, "O-O-O");
+        char s[16];
+        int n = 0;
+        for (const char* c = san; *c && n < 14; c++) {
+            if (*c != '+' && *c != '#' && *c != '!' && *c != '?') s[n++] = *c;   // ignore check / quality marks
+        }
+        s[n] = 0;
+
         Move l[256];
-        int n = genLegal(p, l);
-        for (int i = 0; i < n; i++) {
-            char s[16];
-            toSan(p, l[i], s, false);
-            if (!strcmp(s, clean)) {
-                *out = l[i];
-                return true;
+        int cnt = genLegal(p, l);
+
+        // castling: O-O (king side) and O-O-O (queen side), also written with zeros
+        bool castleK = !strcmp(s, "O-O") || !strcmp(s, "0-0");
+        bool castleQ = !strcmp(s, "O-O-O") || !strcmp(s, "0-0-0");
+        if (castleK || castleQ) {
+            for (int i = 0; i < cnt; i++) {
+                if ((l[i].flags & F_CASTLE) && (castleK ? l[i].to > l[i].from : l[i].to < l[i].from)) {
+                    *out = l[i];
+                    return true;
+                }
             }
+            return false;
+        }
+
+        // piece letter (no letter = pawn)
+        int type = P, i0 = 0;
+        switch (s[0]) {
+            case 'N': type = N; i0 = 1; break;
+            case 'B': type = B; i0 = 1; break;
+            case 'R': type = R; i0 = 1; break;
+            case 'Q': type = Q; i0 = 1; break;
+            case 'K': type = K; i0 = 1; break;
+        }
+
+        // promotion: "=Q" at the end (or "Q" directly after the rank)
+        int promo = 0;
+        if (n >= 2 && s[n - 2] == '=') {
+            promo = (s[n - 1] == 'N') ? N : (s[n - 1] == 'B') ? B : (s[n - 1] == 'R') ? R : (s[n - 1] == 'Q') ? Q : 0;
+            n -= 2;
+        } else if (type == P && n >= 3 && s[n - 2] >= '1' && s[n - 2] <= '8') {
+            promo = (s[n - 1] == 'N') ? N : (s[n - 1] == 'B') ? B : (s[n - 1] == 'R') ? R : (s[n - 1] == 'Q') ? Q : 0;
+            if (promo) n -= 1;
+        }
+
+        // destination square = the last two characters
+        if (n - i0 < 2) return false;
+        int toF = s[n - 2] - 'a', toR = s[n - 1] - '1';
+        if (toF < 0 || toF > 7 || toR < 0 || toR > 7) return false;
+        int to = toR * 8 + toF;
+
+        // what is left in the middle: optional file / rank hint and an optional 'x'
+        int hintF = -1, hintR = -1;
+        for (int k = i0; k < n - 2; k++) {
+            char ch = s[k];
+            if (ch == 'x') continue;
+            if (ch >= 'a' && ch <= 'h') hintF = ch - 'a';
+            else if (ch >= '1' && ch <= '8') hintR = ch - '1';
+            else return false;
+        }
+
+        for (int i = 0; i < cnt; i++) {
+            const Move& m = l[i];
+            if (abs(p.b[m.from]) != type || m.to != to || m.promo != promo) continue;
+            if (hintF >= 0 && (m.from & 7) != hintF) continue;
+            if (hintR >= 0 && (m.from >> 3) != hintR) continue;
+            if (type == P && hintF < 0 && (m.flags & F_CAP)) continue;   // "e4" is a push, a capture always names its file
+            *out = m;
+            return true;
         }
         return false;
     }

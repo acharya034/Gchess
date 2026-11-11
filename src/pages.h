@@ -116,6 +116,7 @@ static void ogParkSlot(int s);   // defined in the Ongoing section below
 
 // Which loaded online game (slot 0/1) is running, if any.
 static int liveSlot() {
+    for (int i = 0; i < 2; i++) if (gNetG[i].active && !GS[i].physical) return i;   // prefer a game that is not on the board
     for (int i = 0; i < 2; i++) if (gNetG[i].active) return i;
     return 0;
 }
@@ -604,7 +605,7 @@ inline void drawStrip(bool top, bool force = false) {
             uint32_t el = millis() - n.stamp;
             t = t > el ? t - el : 0;
         }
-        if (G.mode == GM_ONLINE) fmtClock(t, clk);
+        if (G.mode == GM_ONLINE && n.clocksKnown) fmtClock(t, clk);   // polling mode has no clocks
         xSemaphoreGive(gNetMux);
     } else if (G.mode == GM_PUZZLE) {
         if (top) snprintf(name, 40, "Puzzle %s  (%d)", G.puzId, G.puzRating);
