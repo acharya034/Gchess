@@ -25,6 +25,7 @@ static uint64_t rawLast = 0;          // previous complete frame
 static uint8_t  rawStable = 0;        // identical frames in a row
 static uint8_t  scanRow = 0;          // which positive line the next call scans (0..3)
 static uint32_t scanLast = 0;         // start time of the last frame
+static volatile uint32_t frameCount = 0;   // complete sensor frames since boot
 static volatile bool occChanged = false;
 
 // data line k, positive line i, negative line j  ->  chess square (0..63)
@@ -92,6 +93,7 @@ inline void boardScan() {
   scanRow++;
   if (scanRow < 4) return;                            // frame not finished yet
   scanRow = 0;
+  frameCount++;                                       // NEW
 
   uint64_t raw = rawBuild;
   if (raw == rawLast) {
@@ -136,3 +138,9 @@ inline bool boardRawChanged() {
   occChanged = false;
   return c;
 }
+
+// number of finished sensor frames (setup.h uses it for "stable for N frames")
+inline uint32_t boardFrames() { return frameCount; }
+
+// true once the first debounced occupancy has been published (about 100 ms after boot)
+inline bool boardReady() { return frameCount >= SENSOR_DEBOUNCE + 3; }

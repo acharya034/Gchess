@@ -5,6 +5,18 @@
 #include "game.h"
 #include "net.h"
 #include "debug.h"
+#include "setup.h"          // (game.h already pulls it in; harmless)
+
+// Parameters of the setup page. Fill them with setupPageOpen() before going to PG_SETUP.
+struct SetupPageParams {
+    cr::Position target;
+    char title[24];
+    void (*onDone)();       // board verified by sensors AND confirmed by the user (called after setupEnd())
+    void (*onCancel)();     // Back / Home / Cancel. Called from the page's leave(): do NOT navigate inside it
+    SetupMode mode;         // which side the user plays (placement order)
+};
+static SetupPageParams gSetupPg;
+inline void setupPageOpen(const cr::Position& target, const char* title, void (*onDone)(), void (*onCancel)(), SetupMode mode = SM_WHITE);
 
 struct TC {
     uint16_t limit;
@@ -121,21 +133,33 @@ static int liveSlot() {
     return 0;
 }
 
+static uint8_t gGuardChoice = 0;   // 1 = park / display only, 2 = leave; applied in guardApply() when the new game really starts
+
+// Runs from suDone(): the new game is really starting now, so the old game gets what the user chose.
+static void guardApply() {
+    uint8_t r = gGuardChoice;
+    gGuardChoice = 0;
+    if (!r) return;
+    Game* pg = physLive();
+    if (!pg) return;
+    DBG(GAME, "guard: applying choice %d to slot%d", (int)r, (int)pg->slot);
+    if (r == 1) {
+        if (pg->mode == GM_ONLINE && gPendingOnline) ogParkSlot(pg->slot);   // online -> online: park (stops its live link, it keeps running on Lichess)
+        else { pg->physical = false; pg->syncing = false; }                // otherwise it simply keeps running on the display
+    } else if (r == 2) leaveGame(pg);
+}
+
 // Answer of the "Game in progress" question.
 static void guardCb(int r) {
     DBG(GAME, "new-game guard: user chose %d (1=keep/park old game, 2=leave old game, 3=cancel)", r);
-    Game* pg = physLive();
-    if (r == 1) {
-        if (pg && pg->mode == GM_ONLINE && gPendingOnline) ogParkSlot(pg->slot);   // online -> online: park (stops its live link, it keeps running on Lichess)
-        else if (pg) { pg->physical = false; pg->syncing = false; }                // otherwise it simply keeps running on the display
-    } else if (r == 2) {
-        if (pg) leaveGame(pg);
-    } else return;
-    if (gPendingStart) gPendingStart();
+    if (r != 1 && r != 2) { gGuardChoice = 0; gPendingStart = nullptr; return; }
+    gGuardChoice = r;
+    if (gPendingStart) gPendingStart();   // opens the setup page; the old game is only touched in guardApply()
 }
 
 // Every "start a new game" goes through here: asks what to do with the game that is still on the board.
 static void guardNewGame(void (*fn)(), bool online) {
+    gGuardChoice = 0;
     Game* pg = physLive();
     // Only MAX_LIVE_GAMES online games can be live (memory). If that game is not the one on the board we cannot help.
     if (online && onlineLive() >= MAX_LIVE_GAMES && (!pg || pg->mode != GM_ONLINE)) {
@@ -624,10 +648,10 @@ inline void drawStrip(bool top, bool force = false) {
     if (s) sprEnd();
 }
 
-// The 4 buttons under the board (depend on the game mode).
+// The 4 buttons under the board (depend on the game mode). Pass & play has 5: New | Flip | Undo | Fix | Exit.
 static void gameButtonsDraw() {
-    const char* l[4];
-    uint16_t fg[4] = {T.fg, T.fg, T.fg, T.fg};
+    const char* l[5];
+    uint16_t fg[5] = {T.fg, T.fg, T.fg, T.fg, T.fg};
     switch (G.mode) {
         case GM_ONLINE: l[0] = !G.physical ? "Take board" : G.touchAllowed ? "Touch:ON" : "Touch:OFF";
         fg[0] = (!G.physical || G.touchAllowed) ? T.accent : T.dim;
@@ -638,7 +662,8 @@ static void gameButtonsDraw() {
         case GM_LOCAL: l[0] = "New";
         l[1] = "Flip";
         l[2] = "Undo";
-        l[3] = "Exit";
+        l[3] = "Fix";
+        l[4] = "Exit";
         break;
         case GM_PUZZLE: l[0] = "Hint";
         l[1] = "Skip";
@@ -650,7 +675,8 @@ static void gameButtonsDraw() {
         l[2] = ">";
         l[3] = "Exit";
     }
-    for (int i = 0; i < 4; i++) gfxBtn(2 + i * 60, 297, 56, 22, l[i], T.card, fg[i]);
+    int nb = G.mode == GM_LOCAL ? 5 : 4, bw = 240 / nb;
+    for (int i = 0; i < nb; i++) gfxBtn(2 + i * bw, 297, bw - 4, 22, l[i], T.card, fg[i]);
 }
 
 // Repair only the button area (used after a notification).
@@ -671,11 +697,11 @@ static void promoDraw() {
     }
 }
 
-// The "..." menu of an online game.
+// The "..." menu of an online game (6 rows, 32 px pitch).
 static void sheetDraw() {
-    tft.fillRoundRect(30, BY0 + 10, 180, 206, 12, T.card);
-    const char* l[5] = {"Resign", "Abort game", "Flip display", "Rotate-board mode", "Close"};
-    for (int i = 0; i < 5; i++) gfxBtn(40, BY0 + 20 + i * 36, 160, 30, l[i], i == 0 ? T.bad : T.card2, i == 0 ? GC_WHITE : T.fg);
+    tft.fillRoundRect(30, BY0 + 10, 180, 214, 12, T.card);
+    const char* l[6] = {"Resign", "Abort game", "Flip display", "Rotate-board mode", "Fix board", "Close"};
+    for (int i = 0; i < 6; i++) gfxBtn(40, BY0 + 16 + i * 32, 160, 28, l[i], i == 0 ? T.bad : T.card2, i == 0 ? GC_WHITE : T.fg);
 }
 
 // Draw the complete game page.
@@ -701,6 +727,597 @@ static void gameEnter() {
 static void gameLeave() {
 }
 
+// ======================= SETUP BEFORE A GAME (all flows) =======================
+// ONE place that opens the setup page. Nothing is sent to the network and no game is touched until the
+// board is verified (suDone). Cancel = suCancel: nothing was sent, the old game gets its LEDs back.
+static void (*gSuGo)() = nullptr;      // what happens when the board is ready
+static void (*gSuCancel)() = nullptr;  // optional extra work on cancel (must not navigate)
+static bool gSuPushedGame = false;     // PG_GAME was pushed so Cancel returns to it (PG_GAME is NOPUSH)
+static int8_t gBoardSlot = 0, gResumeSlot = -1;
+static NetPuzzle gPuzPend;             // private copy: the net task may overwrite gPuz
+static char suChId[16];                // private copy of the challenge id
+
+// Board verified (setup page "Yes", or setup skipped).
+static void suDone() {
+    void (*f)() = gSuGo;
+    gSuGo = gSuCancel = nullptr;
+    DBG(SETUP, "setup done -> start the game");
+    guardApply();
+    if (f) f();
+    if (gSuPushedGame && gCur != PG_SETUP && gSp > 0 && gStack[gSp - 1] == PG_GAME) gSp--;   // go() navigated: drop the helper entry
+    gSuPushedGame = false;
+}
+
+// Setup left without finishing (Back / Home / Cancel). Called from the page's leave(): no navigation here.
+static void suCancel() {
+    void (*c)() = gSuCancel;
+    gSuGo = gSuCancel = nullptr;
+    gSuPushedGame = false;
+    gGuardChoice = 0;
+    DBG(SETUP, "setup cancelled: nothing was sent, old game untouched");
+    Game* pg = physLive();
+    if (pg) gameClaimBoard(pg->slot);                                     // repaint its LEDs, recompute syncing
+    else if (lastBoardValid() && boardOccupancy() != gLb.occ) lastBoardInvalidate();   // pieces were moved: map no longer true
+    if (c) c();
+}
+
+// Is the board already exactly the target? Same occupancy AND same piece types as the saved map.
+static bool suAlreadyThere(const cr::Position& t) {
+    if (!gBootChecked || !lastBoardValid()) return false;   // sensors not stable yet / no map
+    uint64_t o = boardOccupancy();
+    if (!gBootUsed) {
+        gBootUsed = true;
+        DBG(SETUP, "first start since boot: boot check said %d, sensors now say %d", (int)gBootCheck, (int)setupBootCheck(o));
+    }
+    if (o != gLb.occ) return false;
+    return !memcmp(gLb.pieces, t.b, 64);
+}
+
+// Open the setup page for a target (or skip it). go() runs when the board is ready.
+static void suStart(const cr::Position& tgt, const char* title, void (*go)(), void (*cancel)(), SetupMode mode, bool force = false) {
+    if (gCur == PG_SETUP || setupActive()) {
+        DBG(SETUP, "setup request '%s' ignored: another setup is open", title);
+        gGuardChoice = 0;
+        uiToast("Finish or cancel the open setup first");
+        return;
+    }
+    gSuGo = go;
+    gSuCancel = cancel;
+    if (!force && suAlreadyThere(tgt)) {
+        DBG(SETUP, "'%s': board already shows the target -> setup page skipped", title);
+        analyticsEvent("setup_skip");
+        suDone();
+        return;
+    }
+    DBG(SETUP, "'%s': opening setup page (force=%d, user plays %s)", title, (int)force, mode == SM_BLACK ? "black" : "white");
+    gSuPushedGame = (gCur == PG_GAME && gSp < 10);
+    if (gSuPushedGame) gStack[gSp++] = PG_GAME;
+    setupPageOpen(tgt, title, suDone, suCancel, mode);
+}
+
+// ---- give the physical board to a running game (Take board / resume / Fix board) ----
+static void boardForGameGo() {
+    int s = gBoardSlot;
+    if (GS[s].mode == GM_NONE || GS[s].mode == GM_REVIEW || GS[s].over) { uiToast("Game is no longer running"); return; }
+    wrongMask = 0;
+    gameClaimBoard(s);       // syncing is normally false now; a move that arrived during setup is guided by LEDs / the sync guard
+    viewGame(s);
+    analyticsEvent("board_taken");
+    uiGo(PG_GAME);
+}
+
+// force = always open the page (Fix board); otherwise skipped when the board already matches.
+static void boardForGame(int slot, const char* title, bool force) {
+    Game& g = GS[slot];
+    cr::Position t;
+    if (!setupTargetFromGame(slot, t) || g.over || g.mode == GM_REVIEW) { uiToast("Nothing to set up"); return; }
+    gBoardSlot = slot;
+    DBG(SETUP, "board for slot%d: '%s' ply=%d (force=%d)", slot, title, (int)g.nHist, (int)force);
+    suStart(t, title, boardForGameGo, nullptr, g.myWhite ? SM_WHITE : SM_BLACK, force);
+}
+
+// Notification "Board out of sync": 2 = Fix board.
+static void fixBoardCb(int r) {
+    if (r != 2) return;
+    Game* pg = physLive();
+    if (pg) boardForGame(pg->slot, "Fix board", true);
+}
+
+// gSet.flipHw was changed (quick menu tile or "..." menu). The sensors are now mapped the other way round,
+// so re-check the SAME position. Returns true when the setup page opened.
+static bool flipHwChanged() {
+    if (setupActive()) return false;           // a setup is already running: it re-plans by itself with the new mapping
+    Game* pg = physLive();
+    if (!pg) return false;
+    if (lastBoardValid() && boardOccupancy() != gLb.occ) {
+        DBG(SETUP, "flipHw=%d: occupancy changed with the mapping -> saved map no longer true", (int)gSet.flipHw);
+        lastBoardInvalidate();   // otherwise guided moves would use wrong piece types
+    }
+    DBG(SETUP, "flipHw=%d: re-checking slot%d", (int)gSet.flipHw, (int)pg->slot);
+    boardForGame(pg->slot, "Check the board", true);
+    return gCur == PG_SETUP;
+}
+
+// ======================= SETUP PAGE (PG_SETUP) =======================
+// Layout: toolbar | title + progress (y 20..38) | board (y 38..278) | subtitle (y 278..296) | buttons (y 297..319)
+// Uses ONLY the public API of setup.h. Drawing happens only when a square / strip really changed.
+static bool spGuide = false;          // "Guide me" pressed: one step at a time
+static bool spAsk = false;            // Yes/No dialog was opened for this S_VERIFY
+static bool spCheck = false;          // "No" answered: walk through piece types
+static bool spFinished = false;       // onDone path: do not call onCancel in leave()
+static uint8_t spGrpIdx = 0, spGrpN = 0;
+static int8_t spGrpPc[12];
+static SetupState spSt = S_IDLE;
+static uint64_t spOcc = 0, spWant = 0, spBad = 0, spFromM = 0, spToM = 0, spRemM = 0, spPlaceM = 0, spGrpM = 0, spArrM = 0;
+static SetupStep spStep;
+static bool spStepOn = false;
+static uint32_t spArrKey = 0xFFFFFFFF;
+static uint64_t spArrCache = 0;
+static uint32_t spHash[64];
+static char spInfoCache[2][64];
+static uint32_t spBtnSig = 0xFFFFFFFF;
+static int spLastRem = -1;
+static SetupState spLastSt = S_IDLE;
+static uint64_t spBadBeeped = 0, spLedOcc = ~0ULL;
+static uint32_t spBadSince = 0, spLedAt = 0;
+static bool spLedForce = true, spWb = true;
+static const char* const SP_TN[7] = {"piece", "pawn", "knight", "bishop", "rook", "queen", "king"};
+#define SP_ARROW_COL RGB(250, 140, 20)
+
+// Arrow between two board squares (centre to centre, a little shorter at both ends). Honours gWhiteBottom via sqXY().
+// Call it inside the sprite of every square the arrow crosses (see spArrowSquares()).
+inline void dArrowSq(int from, int to, uint16_t col, int th = 3) {
+    int x1, y1, x2, y2;
+    sqXY(from, &x1, &y1);
+    sqXY(to, &x2, &y2);
+    float cx1 = x1 + SQP / 2, cy1 = y1 + SQP / 2, cx2 = x2 + SQP / 2, cy2 = y2 + SQP / 2;
+    float dx = cx2 - cx1, dy = cy2 - cy1, len = sqrtf(dx * dx + dy * dy);
+    if (len < 1.0f) return;
+    float ux = dx / len, uy = dy / len, s = fminf(10.0f, len * 0.3f);
+    dArrow(lroundf(cx1 + ux * s), lroundf(cy1 + uy * s), lroundf(cx2 - ux * 4), lroundf(cy2 - uy * 4), col, th);
+}
+
+// Which squares does the arrow touch? (sampled along the line, +-9 px sideways)
+static uint64_t spArrowSquares(int from, int to) {
+    int x1, y1, x2, y2;
+    sqXY(from, &x1, &y1);
+    sqXY(to, &x2, &y2);
+    float cx1 = x1 + SQP / 2, cy1 = y1 + SQP / 2, dx = x2 - x1, dy = y2 - y1, len = sqrtf(dx * dx + dy * dy);
+    if (len < 1.0f) return 0;
+    float ux = dx / len, uy = dy / len, nx = -uy, ny = ux;
+    uint64_t m = 0;
+    for (float t = 0; t <= len + 4; t += 4)
+        for (int off = -9; off <= 9; off += 9) {
+            int px = (int)(cx1 + ux * t + nx * off), py = (int)(cy1 + uy * t + ny * off);
+            int col = px / SQP, row = (py - BY0) / SQP;
+            if (px < 0 || py < BY0 || col > 7 || row > 7) continue;
+            int f = gWhiteBottom ? col : 7 - col, r = gWhiteBottom ? 7 - row : row;
+            m |= 1ULL << (r * 8 + f);
+        }
+    return m;
+}
+
+// Piece drawn "faintly": normal glyph, then every second pixel replaced by the square colour.
+static void spGhost(int x, int y, int8_t pc, uint16_t bg) {
+    gfxPiece(x, y, pc);
+    for (int j = 0; j < SQP; j++)
+        for (int i = j & 1; i < SQP; i += 2) D->drawPixel(x + i - gOx, y + j - gOy, bg);
+}
+
+static void spCross(int x, int y, uint16_t c) {
+    for (int k = -1; k <= 1; k++) {
+        dLine(x + 7 + k, y + 7, x + 22 + k, y + 22, c);
+        dLine(x + 22 + k, y + 7, x + 7 + k, y + 22, c);
+    }
+}
+
+// Which piece-type groups exist in the target (for the "No" check): white K..P, then black K..P.
+static void spBuildGroups() {
+    spGrpN = 0;
+    for (int c = 0; c < 2; c++)
+        for (int t = 6; t >= 1; t--) {
+            int8_t pc = c ? -t : t;
+            for (int sq = 0; sq < 64; sq++) if (gSetupPg.target.b[sq] == pc) { spGrpPc[spGrpN++] = pc; break; }
+        }
+}
+
+// Work out what the screen and the LEDs must show right now (cheap, called every tick).
+static void spCompute() {
+    spWant = cr::occupancy(gSetupPg.target);
+    spFromM = spToM = spRemM = spPlaceM = spGrpM = spArrM = 0;
+    spStepOn = false;
+    if (spSt == S_CLEAR_ALL) { spBad = 0; spRemM = spOcc; return; }       // every piece has to go
+    spBad = spOcc & ~spWant;                                              // overview: every surplus piece is red
+    if (spCheck && spGrpN) {
+        int8_t pc = spGrpPc[spGrpIdx];
+        for (int sq = 0; sq < 64; sq++) if (gSetupPg.target.b[sq] == pc) spGrpM |= 1ULL << sq;
+        return;
+    }
+    if (spGuide && (spSt == S_RESTORE || spSt == S_PLACE)) {
+        const SetupStep* s = setupCurrentStep();
+        spBad = setupBadMask();                                           // guide: engine's mask (current step excluded)
+        if (!s) return;
+        spStep = *s;
+        spStepOn = true;
+        if (s->kind == ST_MOVE) {
+            spFromM = 1ULL << s->sq;
+            spToM = 1ULL << s->to;
+            uint32_t key = s->sq | (uint32_t)s->to << 6 | (uint32_t)gWhiteBottom << 12;
+            if (key != spArrKey) { spArrKey = key; spArrCache = spArrowSquares(s->sq, s->to); }
+            spArrM = spArrCache;
+        } else if (s->kind == ST_REMOVE) spRemM = 1ULL << s->sq;
+        else if (s->kind == ST_PLACE) spPlaceM = 1ULL << s->sq;
+    }
+}
+
+// One square. Redrawn only when its hash changed (sqHash idea).
+static void spDrawSq(int sq, bool force = false) {
+    uint64_t b = 1ULL << sq;
+    uint8_t role = (spFromM & b) ? 1 : (spToM & b) ? 2 : (spRemM & b) ? 3 : (spPlaceM & b) ? 4 : (spGrpM & b) ? 5 : 0;
+    bool occ = spOcc & b, bad = spBad & b, arr = spArrM & b, clr = spSt == S_CLEAR_ALL;
+    int8_t tp = gSetupPg.target.b[sq];
+    uint8_t sp = 0;                                    // glyph of the current step (type | 8 = black)
+    if (spStepOn && ((role >= 1 && role <= 2) || role == 4 || (role == 3 && spStep.kind == ST_REMOVE))) sp = spStep.type | (spStep.white ? 0 : 8);
+    uint32_t h = (uint32_t)(tp + 8) | (uint32_t)occ << 4 | (uint32_t)bad << 5 | (uint32_t)role << 6 | (uint32_t)sp << 9 | 1u << 26;
+    if (arr) h |= 1u << 13 | (uint32_t)spStep.sq << 14 | (uint32_t)spStep.to << 20;
+    if (!force && spHash[sq] == h) return;
+    spHash[sq] = h;
+    int x, y;
+    sqXY(sq, &x, &y);
+    int f = sq & 7, r = sq >> 3;
+    uint16_t c = ((f + r) & 1) ? T.sqLight : T.sqDark;
+    if (bad) c = RGB(225, 60, 60);
+    else if (role == 1) c = RGB(70, 125, 240);
+    else if (role == 2 || role == 4) c = RGB(105, 205, 115);
+    bool s = sprBegin(x, y, SQP, SQP, c);
+    dRect(x, y, SQP, SQP, c);
+    int8_t pc = 0;
+    bool ghost = false;
+    if (role == 1 || role == 2 || role == 4) pc = sp ? ((sp & 8) ? -(sp & 7) : (sp & 7)) : 0;
+    else if (role == 3) { if (sp) { pc = (sp & 8) ? -(sp & 7) : (sp & 7); ghost = true; } }
+    else if (role == 5) pc = tp;
+    else if (!clr && !bad && tp) { pc = tp; ghost = !occ || spCheck; }     // target piece: solid when the square is occupied
+    if (pc) { if (ghost) spGhost(x, y, pc, c); else gfxPiece(x, y, pc); }
+    if (role == 2 || role == 4 || role == 5) {                              // green ring = "put it here"
+        dRing(x + 15, y + 15, 14, RGB(20, 120, 50));
+        dRing(x + 15, y + 15, 13, RGB(20, 120, 50));
+    } else if (role == 3) {                                                 // red ring + cross = "take it away"
+        dRing(x + 15, y + 15, 14, RGB(230, 50, 40));
+        dRing(x + 15, y + 15, 13, RGB(230, 50, 40));
+        spCross(x, y, RGB(230, 50, 40));
+    }
+    if (arr) dArrowSq(spStep.sq, spStep.to, SP_ARROW_COL, 3);
+    if (s) sprEnd();
+}
+
+// What is happening (text under the board).
+static void spSubtitle(char* o, uint16_t* col) {
+    char a[3], b[3];
+    *col = T.accent;
+    if (spSt == S_CLEAR_ALL) { strcpy(o, "Remove ALL pieces from the board"); *col = T.bad; return; }
+    if (spCheck && spGrpN) {
+        int8_t pc = spGrpPc[spGrpIdx];
+        int n = __builtin_popcountll(spGrpM);
+        const char* cn = pc > 0 ? "White" : "Black";
+        if (n > 4) snprintf(o, 48, "%s %s x%d - check them", cn, SP_TN[abs(pc)], n);
+        else {
+            int k = snprintf(o, 48, "%s %s:", cn, SP_TN[abs(pc)]);
+            for (uint64_t m = spGrpM; m && k < 40; m &= m - 1) {
+                cr::sqName(__builtin_ctzll(m), a);
+                k += snprintf(o + k, 48 - k, " %s", a);
+            }
+        }
+        return;
+    }
+    if (spSt == S_VERIFY) { strcpy(o, "Board complete - please confirm"); *col = T.ok; return; }
+    if (spStepOn) {
+        const SetupStep& s = spStep;
+        const char* cn = s.white ? "white" : "black";
+        cr::sqName(s.sq, a);
+        cr::sqName(s.to, b);
+        if (s.kind == ST_MOVE) snprintf(o, 48, "Move %s %s %s -> %s", cn, SP_TN[s.type], a, b);
+        else if (s.kind == ST_REMOVE) {
+            if (s.type) snprintf(o, 48, "Remove %s %s on %s", cn, SP_TN[s.type], a);
+            else snprintf(o, 48, "Remove the piece on %s", a);
+            *col = T.bad;
+        } else snprintf(o, 48, "Place %s %s on %s", cn, SP_TN[s.type], a);
+        return;
+    }
+    if (spBad) { strcpy(o, "Take away pieces on red squares"); *col = T.warn; return; }
+    strcpy(o, "Set up the position shown");
+}
+
+// Title (left) + progress (right), y 20..38.
+static void spDrawTop(bool force) {
+    char p[40];
+    if (spSt == S_CLEAR_ALL) {
+        int n = __builtin_popcountll(spOcc);
+        snprintf(p, 40, "%d piece%s left", n, n == 1 ? "" : "s");
+    } else {
+        int ok = __builtin_popcountll(spOcc & spWant), tot = __builtin_popcountll(spWant);
+        snprintf(p, 40, "%d / %d pieces correct", ok, tot);
+        if (tft.textWidth(gSetupPg.title, &fonts::Font2) + tft.textWidth(p, &fonts::Font2) > 222) snprintf(p, 40, "%d / %d correct", ok, tot);
+    }
+    char sig[96];
+    snprintf(sig, sizeof(sig), "%s|%s", gSetupPg.title, p);
+    if (!force && !strcmp(sig, spInfoCache[0])) return;
+    strlcpy(spInfoCache[0], sig, 64);
+    bool s = sprBegin(0, TB_H, 240, 18, T.card);
+    dRect(0, TB_H, 240, 18, T.card);
+    int pw = tft.textWidth(p, &fonts::Font2);
+    gfxText(234, TB_H + 1, p, 1, T.fg, TD_TR);
+    char t[48];
+    fitText(t, gSetupPg.title, 232 - pw - 10);
+    gfxText(8, TB_H + 1, t, 1, T.dim);
+    if (s) sprEnd();
+}
+
+// Subtitle strip, y 278..296.
+static void spDrawSub(bool force) {
+    char t[48];
+    uint16_t col;
+    spSubtitle(t, &col);
+    char sig[64];
+    snprintf(sig, sizeof(sig), "%u|%s", (unsigned)col, t);
+    if (!force && !strcmp(sig, spInfoCache[1])) return;
+    strlcpy(spInfoCache[1], sig, 64);
+    int y = BY0 + 8 * SQP;
+    bool s = sprBegin(0, y, 240, 18, T.card);
+    dRect(0, y, 240, 18, T.card);
+    char f[48];
+    fitText(f, t, 230);
+    gfxText(120, y + 1, f, 1, col, TD_TC);
+    if (s) sprEnd();
+}
+
+// [Guide me | Show all | Next piece | Finished]   [Cancel]
+static void spBtns(Btn* b) {
+    const char* l1;
+    uint16_t bg1 = T.accent, fg1 = INK;
+    if (spSt == S_CLEAR_ALL) { l1 = "Guide me"; bg1 = T.card; fg1 = T.dim; }           // not possible yet
+    else if (spCheck) l1 = (spGrpIdx + 1 < spGrpN) ? "Next piece" : "Finished";
+    else l1 = spGuide ? "Show all" : "Guide me";
+    b[0] = Btn{6, 297, 112, 22, l1, 1, bg1, fg1};
+    b[1] = Btn{122, 297, 112, 22, "Cancel", 2, T.card2, T.fg};
+}
+
+static void spDrawButtons() {
+    Btn b[2];
+    spBtns(b);
+    uiDrawBtn(b[0]);
+    uiDrawBtn(b[1]);
+}
+
+// Paint everything that changed. force = every square, strip and button again.
+static void spPaint(bool force) {
+    if (spWb != gWhiteBottom) { spWb = gWhiteBottom; force = true; }
+    if (force) {
+        memset(spHash, 0, sizeof(spHash));
+        spInfoCache[0][0] = spInfoCache[1][0] = 0;
+        spBtnSig = 0xFFFFFFFF;
+    }
+    for (int i = 0; i < 64; i++) spDrawSq(i);
+    spDrawTop(false);
+    spDrawSub(false);
+    uint32_t bs = (uint32_t)spGuide | (uint32_t)spCheck << 1 | (uint32_t)(spCheck && spGrpIdx + 1 >= spGrpN) << 2 | (uint32_t)(spSt == S_CLEAR_ALL) << 3;
+    if (bs != spBtnSig) { spBtnSig = bs; spDrawButtons(); }
+}
+
+// Draw only while nothing is on top of the page (menu, dialog, keyboard) and the screen is on.
+static void spRender() {
+    if (gModal != MD_NONE || gScreenOff || gCur != PG_SETUP) return;
+    spPaint(false);
+}
+
+// LEDs. Overview = target dim; guide = ONE step; clear phase = occupied squares flash red. Wrong squares flash red.
+static void spDrawLeds() {
+    if (!setupActive()) return;
+    ledsClear();
+    ledsClearOverlay();
+    if (spSt == S_CLEAR_ALL) { ledsFlashMask(spOcc, SU_RED, 60000); return; }
+    if (spCheck) {
+        for (uint64_t m = spWant; m; m &= m - 1) ledSq(__builtin_ctzll(m), SU_DIM);
+        for (uint64_t m = spGrpM; m; m &= m - 1) ledSq(__builtin_ctzll(m), SU_GREEN);
+    } else if (spStepOn) {
+        if (spStep.kind == ST_MOVE) { ledSq(spStep.sq, SU_BLUE); ledSq(spStep.to, SU_GREEN); }
+        else if (spStep.kind == ST_REMOVE) ledSq(spStep.sq, SU_RED);
+        else ledSq(spStep.sq, SU_GREEN);
+    } else {
+        for (uint64_t m = spWant; m; m &= m - 1) ledSq(__builtin_ctzll(m), SU_DIM);
+    }
+    if (spBad) ledsFlashMask(spBad, SU_RED, 60000);
+}
+
+// Leave the page after a finished setup or a cancel (no uiBack(): the game's leave guard is not wanted here).
+static void spClose() {
+    if (gSp > 0) uiGo(gStack[--gSp], false);
+    else uiGo(PG_HOME, false);
+}
+
+// "Yes": look at the sensors once more. Only if they STILL equal the target (and the engine agrees) we are done.
+static void spYes() {
+    uint64_t o = boardOccupancy();
+    SetupState st = setupTick(o);
+    if (o == cr::occupancy(gSetupPg.target) && st == S_VERIFY) {
+        DBG(UI, "setup page: confirmed, board verified twice");
+        setupConfirm(true);                    // engine -> S_DONE, remembers the board
+        analyticsEvent("setup_done");
+        soundPlay(SND_SUCCESS);
+        spFinished = true;
+        setupEnd();                            // LEDs off BEFORE onDone, so onDone can paint the game's LEDs
+        void (*cb)() = gSetupPg.onDone;
+        if (cb) cb();
+        if (gCur == PG_SETUP) spClose();       // onDone did not navigate
+    } else {
+        DBG(UI, "setup page: YES refused, sensors differ from target");
+        analyticsEvent("setup_wrong");
+        spSt = st;
+        spOcc = o;
+        spLedForce = true;
+        uiNotify("Board does not match yet", "A piece moved. Fix the red squares, then confirm again.", 1, nullptr, "Close", "", SND_WRONG);
+        spCompute();
+        spRender();
+    }
+}
+
+static void spVerifyCb(int r) {
+    spAsk = false;
+    if (r == 2) { spYes(); return; }
+    DBG(UI, "setup page: NO -> check piece types");
+    analyticsEvent("setup_no");
+    spBuildGroups();
+    spGrpIdx = 0;
+    spCheck = spGrpN > 0;
+    spLedForce = true;
+    spCompute();
+    spRender();
+}
+
+// First button.
+static void spGuideBtn() {
+    if (spSt == S_CLEAR_ALL) { uiToast("Remove all pieces first"); return; }
+    if (spCheck) {
+        if (spGrpIdx + 1 < spGrpN) spGrpIdx++;
+        else { spCheck = false; spAsk = false; }          // finished: the Yes/No box comes back by itself
+    } else {
+        spGuide = !spGuide;
+        analyticsEvent("setup_guide", spGuide ? 1 : 0);
+        DBG(UI, "setup page: guide %s", spGuide ? "ON" : "OFF");
+        spLastRem = -1;
+    }
+    spLedForce = true;
+    spCompute();
+    spRender();
+}
+
+static void spEnter() {
+    spGuide = spAsk = spCheck = spFinished = false;
+    spGrpIdx = spGrpN = 0;
+    spArrKey = 0xFFFFFFFF;
+    spLastRem = -1;
+    spLastSt = S_IDLE;
+    spBadBeeped = 0;
+    spBadSince = 0;
+    spLedOcc = ~0ULL;
+    spLedForce = true;
+    spWb = gWhiteBottom;
+    memset(spHash, 0, sizeof(spHash));
+    spInfoCache[0][0] = spInfoCache[1][0] = 0;
+    spBtnSig = 0xFFFFFFFF;
+    DBG(UI, "setup page: enter '%s'", gSetupPg.title);
+    setupBegin(gSetupPg.target, gSetupPg.mode);
+    spOcc = boardOccupancy();
+    spSt = setupTick(spOcc);
+    spLastSt = spSt;
+    spCompute();
+    spDrawLeds();
+    spLedAt = millis();
+}
+
+static void spDraw() {
+    spOcc = boardOccupancy();
+    spCompute();
+    spPaint(true);
+}
+
+// Everything except the board (used after a notification).
+static void spPartial() {
+    int y = BY0 + 8 * SQP;
+    tft.fillRect(0, y, 240, 320 - y, T.bg);
+    spCompute();
+    spInfoCache[0][0] = spInfoCache[1][0] = 0;
+    spDrawTop(true);
+    spDrawSub(true);
+    spDrawButtons();
+}
+
+static void spTouch(TouchPhase ph, int x, int y) {
+    if (ph != TP_UP || y < 296) return;
+    Btn b[2];
+    spBtns(b);
+    int id = uiHitBtns(b, 2, x, y);        // logs analyticsButton() + click sound
+    if (id == 1) spGuideBtn();
+    else if (id == 2) spClose();           // leave() logs "setup_cancel" and calls onCancel
+}
+
+static void spTick() {
+    if (!setupActive()) return;
+    uint32_t now = millis();
+    uint64_t occ = boardOccupancy();
+    SetupState old = spSt;
+    SetupState st = setupTick(occ);
+    spSt = st;
+    spOcc = occ;
+    if (spCheck && st != S_VERIFY) spCheck = false;          // somebody touched the board: normal flow again
+    spCompute();
+
+    // --- sounds ---
+    if (old == S_CLEAR_ALL && st != S_CLEAR_ALL) {
+        soundPlay(SND_MOVE_OK);
+        spLastRem = setupRemaining();
+    } else if (st != S_CLEAR_ALL && st != S_VERIFY) {
+        int rem = setupRemaining();
+        if (spGuide && spLastRem >= 0 && rem < spLastRem) soundPlay(SND_MOVE_OK);   // one step done
+        spLastRem = rem;
+    } else spLastRem = -1;
+    uint64_t newBad = spBad & ~spBadBeeped;
+    spBadBeeped &= spBad;
+    if (!newBad) spBadSince = 0;
+    else if (!spBadSince) spBadSince = now | 1;
+    else if (now - spBadSince > 700) {                          // a wrong square that stays for 0.7 s
+        soundPlay(SND_WRONG);
+        analyticsEvent("setup_wrong");
+        DBG(UI, "setup page: wrong squares");
+        spBadBeeped |= spBad;
+        spBadSince = 0;
+    }
+
+    // --- LEDs (the engine repaints its own pattern now and then; we repaint ours at least every second) ---
+    if (st != old || occ != spLedOcc || spLedForce || now - spLedAt > 1000) {
+        spDrawLeds();
+        spLedAt = now;
+        spLedOcc = occ;
+        spLedForce = false;
+    }
+    spLastSt = st;
+
+    // --- screen ---
+    spRender();
+
+    // --- Yes / No question (never while a menu or dialog is open) ---
+    if (st == S_VERIFY && !spAsk && !spCheck && gModal == MD_NONE && !gScreenOff) {
+        spAsk = true;
+        soundPlay(SND_NOTIFY);
+        DBG(UI, "setup page: board equals target -> ask");
+        uiDialog("Board ready?", "Is the board set up\ncorrectly?", "No", "Yes", spVerifyCb);
+    }
+}
+
+static void spEvent(const UiEvt& e) {
+    (void)e;    // nothing to do; globalEvt() still handles challenges and game starts
+}
+
+// Back / Home / Cancel / quick menu: LEDs off, then onCancel. After a finished setup spFinished is set: no onCancel.
+static void spLeave() {
+    bool fin = spFinished;
+    setupEnd();                              // clears the LEDs
+    spAsk = spCheck = false;
+    if (fin) return;
+    DBG(UI, "setup page: cancelled");
+    analyticsEvent("setup_cancel");
+    if (gSetupPg.onCancel) gSetupPg.onCancel();
+}
+
+// One line for every other page.
+inline void setupPageOpen(const cr::Position& target, const char* title, void (*onDone)(), void (*onCancel)(), SetupMode mode) {
+    gSetupPg.target = target;
+    strlcpy(gSetupPg.title, (title && title[0]) ? title : "Set up the board", sizeof(gSetupPg.title));
+    gSetupPg.onDone = onDone;
+    gSetupPg.onCancel = onCancel;
+    gSetupPg.mode = mode;
+    uiGo(PG_SETUP);
+}
+
 // the game (and the LEDs) keep running when you leave the page
 static void gameFinishDlg(int r) {
     if (r == 1) {
@@ -715,8 +1332,18 @@ static void showResult(const char* msg, bool win) {
     soundPlay(win ? SND_SUCCESS : SND_FAIL);
     analyticsEvent("game_end", win);
     if (G.physical) {
-        G.physical = false;
-        ledsClear();
+        bool su = setupActive();
+        bool match = !su && boardOccupancy() == G.expected;
+        if (match) {                                   // final position IS on the board: remember it for the next start
+            lastBoardSave(G.pos);
+            lastBoardFlush();
+            DBG(SETUP, "game end: final position saved");
+        }
+        if (match || su) {
+            G.physical = false;
+            if (!su) ledsClear();                      // never wipe the LEDs of a running setup
+        } else DBG(SETUP, "game end: last move not on the board yet, keeping the board until it is mirrored");
+        // else: gameSensorTick() saves + releases the board when the user mirrors the last move
     }
     bool viewing = gCur == PG_GAME && gGp == &GS[gView];
     if (viewing) {
@@ -773,11 +1400,25 @@ static void physTick() {
         analyticsEvent("wrong_move");
         wrongMask = boardOccupancy() & ~G.expected;
         wrongUntil = millis() + 2500;
-        uiToast("Wrong move - put it back");
+        uiToast("Wrong move - put it back");           // (G: unchanged behaviour)
     }
     if (viewing && promoShown && !G.promoPending) {
         promoShown = false;
         gameDraw();
+    }
+    // --- sync guard: LEDs cover ONE move; anything bigger is offered to the setup page (never opened by itself) ---
+    static uint32_t farSince = 0;
+    static int8_t offered = -1;
+    if (G.syncing && !G.over && __builtin_popcountll(boardOccupancy() ^ G.expected) > 4) {
+        if (!farSince) farSince = millis() | 1;
+        else if (millis() - farSince > 2500 && offered != idx && gModal == MD_NONE) {
+            offered = idx;
+            DBG(SETUP, "sync guard: slot%d board differs by %d squares -> offering Fix board", idx, __builtin_popcountll(boardOccupancy() ^ G.expected));
+            uiNotify("Board out of sync", "The board differs from the game by more than one move.\nOpen the setup guide to fix it?", 2, fixBoardCb, "Later", "Fix board");
+        }
+    } else {
+        farSince = 0;
+        if (!G.syncing) offered = -1;
     }
 }
 
@@ -796,8 +1437,8 @@ static void gameTick() {
 }
 
 // ----- starting games -----
-// Start a pass & play game on this board.
-static void doStartLocal() {
+// Every flow: [guard question] -> suStart() -> setup page (or skipped) -> ...Go() runs when the board is verified.
+static void doStartLocalGo() {
     {
         GameScope sc(2);
         gameReset(GM_LOCAL, nullptr, true);
@@ -810,26 +1451,45 @@ static void doStartLocal() {
     uiGo(PG_GAME);
 }
 
+// Start a pass & play game on this board (setup first).
+static void doStartLocal() {
+    cr::Position st;
+    setupTargetStart(st);
+    suStart(st, "Set up the board", doStartLocalGo, nullptr, SM_WHITE);
+}
+
 // Pass & play button (asks first if another game is on the board).
 static void localStart() {
     guardNewGame(doStartLocal, false);
 }
 
-// Create a game against Stockfish.
-static void doStartAi() {
+// Create a game against Stockfish (runs after the board is verified).
+static void doStartAiGo() {
     if (gNetState < 3) {
         uiToast("Not online");
         soundPlay(SND_WRONG);
         return;
-    } gExpectGame = millis() + 90000;
+    } gExpectGame = millis() + 90000;                   // AFTER setup: the auto-jump window starts now
     const char* col[3] = {"random", "white", "black"};
     analyticsEvent("start_ai", gAiLevel);
     netCmd(NC_AI, col[gColorSel], "", gAiLevel, TCS[gTc].limit, TCS[gTc].inc);
     uiGo(PG_WAIT);
 }
 
-// Send a challenge to a friend.
-static void doStartFriend() {
+// Computer game: setup first, the command is sent in doStartAiGo().
+static void doStartAi() {
+    if (gNetState < 3) {                                // fail early, before the setup work
+        uiToast("Not online");
+        soundPlay(SND_WRONG);
+        return;
+    }
+    cr::Position st;
+    setupTargetStart(st);
+    suStart(st, "Set up the board", doStartAiGo, nullptr, gColorSel == 2 ? SM_BLACK : SM_WHITE);
+}
+
+// Send a challenge to a friend (runs after the board is verified).
+static void doStartFriendGo() {
     if (gNetState < 3) {
         uiToast("Not online");
         soundPlay(SND_WRONG);
@@ -841,8 +1501,20 @@ static void doStartFriend() {
     uiGo(PG_WAIT);
 }
 
-// Look for an opponent online.
-static void doStartSeek() {
+// Friend challenge: setup first.
+static void doStartFriend() {
+    if (gNetState < 3) {
+        uiToast("Not online");
+        soundPlay(SND_WRONG);
+        return;
+    }
+    cr::Position st;
+    setupTargetStart(st);
+    suStart(st, "Set up the board", doStartFriendGo, nullptr, gColorSel == 2 ? SM_BLACK : SM_WHITE);
+}
+
+// Look for an opponent online (runs after the board is verified).
+static void doStartSeekGo() {
     if (gNetState < 3) {
         uiToast("Not online");
         soundPlay(SND_WRONG);
@@ -852,16 +1524,51 @@ static void doStartSeek() {
     uiGo(PG_WAIT);
 }
 
+// Quick match: setup first (colour unknown until the game starts).
+static void doStartSeek() {
+    if (gNetState < 3) {
+        uiToast("Not online");
+        soundPlay(SND_WRONG);
+        return;
+    }
+    cr::Position st;
+    setupTargetStart(st);
+    suStart(st, "Set up the board", doStartSeekGo, nullptr, SM_WHITE);
+}
+
 static char chId[16];
-// Accept the challenge.
-static void doAccept() {
+// Accept the challenge (runs after the board is verified). The id was copied into suChId before the setup.
+static void doAcceptGo() {
     gExpectGame = millis() + 30000;
-    netCmd(NC_ACCEPT, chId);
+    netCmd(NC_ACCEPT, suChId);
+}
+
+// Accept: setup first (a newer challenge may overwrite chId meanwhile, so the id is copied now).
+static void doAccept() {
+    strlcpy(suChId, chId, sizeof(suChId));
+    cr::Position st;
+    setupTargetStart(st);
+    suStart(st, "Set up the board", doAcceptGo, nullptr, SM_WHITE);
 }
 
 // Ask the network task for a puzzle.
 static void doPuzzleReq() {
     netCmd(NC_PUZ_DAILY, "", "", puzReqMode);
+}
+
+// Puzzle start after the board is verified (flow C).
+static void puzzleGo() {
+    {
+        GameScope sc(2);
+        gamePuzzleStart(gPuzPend.id, gPuzPend.rating, gPuzPend.fen, gPuzPend.sol);
+        G.touchAllowed = true;
+        G.physical = false;
+    }
+    gameClaimBoard(2);
+    viewGame(2);
+    analyticsEvent("puzzle_start");
+    if (gCur == PG_GAME) gameDraw();
+    else uiGo(PG_GAME);
 }
 
 // ----- leaving the game page -----
@@ -902,11 +1609,12 @@ static void resignCb(int r) {
     }
 }
 
-// Answer of "New game?".
+// Answer of "New game?": reset the game, then set the board up for the start position.
 static void localNewCb(int r) {
     if (r == 2) {
         gameReset(GM_LOCAL, nullptr, true);
         gameDraw();
+        boardForGame(G.slot, "Set up the board", false);   // the physical board still shows the old position
     }
 }
 
@@ -943,9 +1651,9 @@ static void gameTouch(TouchPhase ph, int x, int y) {
         } return;
     }
     if (sheetOpen) {
-        int i = (y - BY0 - 20) / 36;
+        int i = (y - BY0 - 16) / 32;
         sheetOpen = false;
-        if (y >= BY0 + 20 && i >= 0 && i < 5) {
+        if (y >= BY0 + 16 && i >= 0 && i < 6) {
             uiTap();
             if (i == 0) {
                 gameDraw();
@@ -955,7 +1663,13 @@ static void gameTouch(TouchPhase ph, int x, int y) {
             else if (i == 2) G.whiteBottom = !G.whiteBottom;
             else if (i == 3) {
                 gSet.flipHw = !gSet.flipHw;
+                storageSaveSettings();
                 uiToast(gSet.flipHw ? "Board rotated mode ON" : "Board rotated mode OFF");
+                if (flipHwChanged()) return;           // setup page opened: it repaints everything
+            } else if (i == 4) {
+                gameDraw();
+                boardForGame(G.slot, "Fix board", true);
+                return;
             }
         }
         gameDraw();
@@ -976,8 +1690,9 @@ static void gameTouch(TouchPhase ph, int x, int y) {
         } return;
     }
     if (y < 296) return;
-    int b = x / 60;
-    if (b > 3) return;
+    int nb = G.mode == GM_LOCAL ? 5 : 4;
+    int b = x / (240 / nb);
+    if (b >= nb) return;
     uiTap();
     analyticsButton(PG_GAME, "game_btn");
     const char* gid = gNetG[G.slot & 1].id;
@@ -987,8 +1702,8 @@ static void gameTouch(TouchPhase ph, int x, int y) {
                 G.touchAllowed = !G.touchAllowed;
                 uiToast(G.touchAllowed ? "Touch play allowed" : "Touch play blocked");
             } else {
-                gameClaimBoard(G.slot);
-                uiToast("This game now uses the board");
+                boardForGame(G.slot, "Set up the position", false);   // Take board = setup first (flow D)
+                return;
             }
             gameButtonsDraw();
         } else if (b == 1) {
@@ -1001,21 +1716,17 @@ static void gameTouch(TouchPhase ph, int x, int y) {
             sheetOpen = true;
             sheetDraw();
         } break;
-        case GM_LOCAL: if (b == 0) uiDialog("New game?", "Reset to the start position.", "No", "Yes", localNewCb);
-        else if (b == 1) {
-            G.whiteBottom = !G.whiteBottom;
-            gameDraw();
-        } else if (b == 2) {
-            if (G.nHist) {
-                static cr::Move save[512];
-                int n = G.nHist - 1;
-                memcpy(save, G.hist, sizeof(cr::Move) * n);
-                gameReset(GM_LOCAL, nullptr, true);
-                for (int i = 0; i < n; i++) gameApply(save[i], true);
+        case GM_LOCAL:
+            if (b == 0) uiDialog("New game?", "Reset to the start position.", "No", "Yes", localNewCb);
+            else if (b == 1) {
+                G.whiteBottom = !G.whiteBottom;
                 gameDraw();
-            }
-        } else uiHome();
-        break;
+            } else if (b == 2) {
+                gameUndo();                                           // LEDs say "put it back"; the saved map follows the real board
+                gameDraw();
+            } else if (b == 3) boardForGame(G.slot, "Fix board", true);
+            else uiHome();
+            break;
         case GM_PUZZLE: if (b == 0 && G.puzIdx < G.puzN) {
             cr::Move m;
             if (cr::fromUci(G.pos, G.puzSol[G.puzIdx], &m)) {
@@ -1069,6 +1780,11 @@ static void onGameUpdate(int slot, bool full) {
         drawStrip(true);
         drawStrip(false);
     } else if (applied > 0 && G.pos.white == G.myWhite) uiToast("Opponent moved - your turn");
+    if (gResumeSlot == slot && gModal == MD_NONE) {     // resumed from the list: moves are applied now -> setup to THIS position
+        gResumeSlot = -1;
+        DBG(SETUP, "resume slot%d: moves applied (ply=%d) -> setup", slot, (int)G.nHist);
+        boardForGame(slot, "Set up the position", false);
+    }
 }
 
 // The server says the game is over.
@@ -1185,9 +1901,7 @@ static void ogTouch(TouchPhase ph, int x, int y) {
             return;
         }
         if (x >= bx - 86 && x < bx - 44 && !g.physical) {
-            gameClaimBoard(r.slot);
-            uiToast("This game now uses the board");
-            ogDraw();
+            boardForGame(r.slot, "Set up the position", false);   // setup first, then the game gets the board
             return;
         }
         viewGame(r.slot);
@@ -1430,8 +2144,8 @@ static void settingsTouch(TouchPhase ph, int x, int y) {
     }
     if (setDrag && (ph == TP_DOWN || ph == TP_MOVE)) {
         float f = constrain((x - 76) / 150.0f, 0.0f, 1.0f);
-        if (setRow == 0) gfxSetBrightness(10 + f * 245);
-        else ledSetBrightness(5 + f * 250);
+        if (setRow == 0) gfxSetBrightness(5 + f * 250);
+        else ledSetBrightness(5 + f * 254);
         gfxSliderBox(76, 26 + setRow * 32, 150, setRow ? gSet.ledBright : gSet.tftBright, setRow ? 5 : 10, 255, T.bg);
         return;
     }
@@ -1540,7 +2254,9 @@ static bool globalEvt(const UiEvt& e) {
             int slot = e.a >> 1;
             bool white = e.a & 1;
             bool mine = gExpectGame && millis() < gExpectGame;
-            bool claim = (mine && !gOpenedFromList) || !physLive();
+            bool resume = mine && gOpenedFromList;       // resuming a game that already has moves
+            bool claim = (mine && !resume) || (!mine && !physLive());
+            bool fits;
             strlcpy(gOpp, e.s1, 32);
             gOppRating = e.b;
             analyticsEvent("game_start");
@@ -1549,8 +2265,12 @@ static bool globalEvt(const UiEvt& e) {
                 gameReset(GM_ONLINE, nullptr, white);
                 G.touchAllowed = true;
                 G.physical = false;
+                fits = boardOccupancy() == G.expected;   // board was verified before the request, unless someone moved pieces
             }
-            if (claim) gameClaimBoard(slot);
+            DBG(GAME, "game start slot%d white=%d mine=%d resume=%d claim=%d fits=%d", slot, (int)white, (int)mine, (int)resume, (int)claim, (int)fits);
+            if (resume) gResumeSlot = slot;              // board is offered after the first update (moves known)
+            else if (claim && fits) gameClaimBoard(slot);
+            else if (claim) uiToast("Board moved - tap Take board");
             if (mine) {
                 gExpectGame = 0;
                 gOpenedFromList = false;
@@ -1559,7 +2279,7 @@ static bool globalEvt(const UiEvt& e) {
                 gSp = 0;
                 gStack[gSp++] = PG_HOME;
                 uiGo(PG_GAME, false);
-                if (!white) uiToast("You are Black: turn the board or use Rotate mode", 3500);
+                if (!white) uiToast("You are Black: turn the board or use Rotate mode", 3500);   // existing hint; flipping -> flipHwChanged()
             } else {
                 char m[48];
                 snprintf(m, 48, "Game vs %s is running (Home > Ongoing)", e.s1);
@@ -1591,19 +2311,12 @@ static bool globalEvt(const UiEvt& e) {
         return true;
         case UE_PUZZLE: {
             xSemaphoreTake(gNetMux, portMAX_DELAY);
-            NetPuzzle pz = gPuz;
+            gPuzPend = gPuz;                              // private copy under the mutex
             xSemaphoreGive(gNetMux);
-            {
-                GameScope sc(2);
-                gamePuzzleStart(pz.id, pz.rating, pz.fen, pz.sol);
-                G.touchAllowed = true;
-                G.physical = false;
-            }
-            gameClaimBoard(2);
-            viewGame(2);
-            analyticsEvent("puzzle_start");
-            if (gCur == PG_GAME) gameDraw();
-            else uiGo(PG_GAME);
+            cr::Position tg;
+            if (!setupTargetFen(tg, gPuzPend.fen)) { uiToast("Bad puzzle position"); return true; }
+            DBG(SETUP, "puzzle %s: setup first (side to move: %s)", gPuzPend.id, tg.white ? "white" : "black");
+            suStart(tg, "Set up the puzzle", puzzleGo, nullptr, tg.white ? SM_WHITE : SM_BLACK);
             return true;
         }
         case UE_EXPORT: {
@@ -1645,6 +2358,7 @@ inline void pagesBegin() {
     gPages[PG_GAME] = {"Game", gameEnter, gameDraw, gameTouch, gameTick, gameLeave, nullptr, PF_TOOLBAR | PF_NOPUSH, gamePartial};
     gPages[PG_ONGOING] = {"Ongoing games", ogEnter, ogDraw, ogTouch, nullptr, nullptr, ogEvent, PF_TOOLBAR};
     gLeaveGuard = leaveGuard;
+    gOnFlipHw = flipHwChanged;
     gPages[PG_PUZZLE] = {"Puzzles", nullptr, puzzleDraw, puzzleTouch, nullptr, nullptr, nullptr, PF_TOOLBAR};
     gPages[PG_HISTORY] = {"History", historyEnter, listDraw, historyTouch, nullptr, nullptr, listEvent, PF_TOOLBAR};
     gPages[PG_FRIENDS] = {"Friends", friendsEnter, friendsDraw, friendsTouch, nullptr, nullptr, listEvent, PF_TOOLBAR};
@@ -1652,4 +2366,5 @@ inline void pagesBegin() {
     gPages[PG_WIFI] = {"Wi-Fi", wifiEnter, wifiDraw, wifiTouch, nullptr, nullptr, listEvent, PF_TOOLBAR};
     gPages[PG_BOARDTEST] = {"Board test", nullptr, btDraw, btTouch, btTick, [](){ ledsClear();}, nullptr, PF_TOOLBAR};
     gPages[PG_ABOUT] = {"About", nullptr, aboutDraw, nullptr, nullptr, nullptr, nullptr, PF_TOOLBAR};
+    gPages[PG_SETUP] = {"Set up", spEnter, spDraw, spTouch, spTick, spLeave, spEvent, PF_TOOLBAR | PF_NOPUSH, spPartial};
 }

@@ -7,13 +7,14 @@
 //   gameSensorTick(occ)                   feed the debounced sensor bitboard, returns GEvt
 //   gameTouchSquare(sq)                   touch input on the on-screen board, returns GEvt
 //   gameSubmit(from,to,promo)             finish a move (e.g. after promotion choice), returns GE_MOVE
-//   gameCanMoveNow()   gameLoadSan("e4 e5 ...")   gameRevGoto(i)   gamePuzzleCheck()
+//   gameCanMoveNow()   gameLoadSan("e4 e5 ...")   gameRevGoto(i)   gamePuzzleCheck()   gameUndo()
 #pragma once
 #include "chess_rules.h"
 #include "leds.h"
 #include "board.h"
 #include "sound.h"
 #include "debug.h"
+#include "setup.h"
 
 enum GameMode : uint8_t {
     GM_NONE,
@@ -73,6 +74,7 @@ struct Game {
 static Game* GS = nullptr;  // 3 games, allocated from the heap in gamesInit() (too big for static RAM)
 static Game* gGp = nullptr;
 #define G (*gGp)
+static bool gReplay = false;   // true while intermediate plies are rebuilt: only the LAST ply may update the saved board map
 // temporarily make another game the "current" one (all game functions use G)
 struct GameScope {
     Game* old;
@@ -85,30 +87,12 @@ struct GameScope {
         gGp = old;
     }
 };
-// LED helpers: only the game that owns the physical board may touch the LEDs
-inline void gLedsClear() {
-    if (gGp->physical) ledsClear();
-}
-
-// Light one square - only if this game owns the physical board.
-inline void gLedSq(int sq, CRGB c) {
-    if (gGp->physical) ledSq(sq, c);
-}
-
-// Show the last move (blue = from, green = to) - only on the board owner.
-inline void gLedsShowLastMove(int a, int b) {
-    if (gGp->physical) ledsShowLastMove(a, b);
-}
-
-// Show the legal moves of a lifted piece - only on the board owner.
-inline void gLedsShowOptions(int f, uint64_t d, uint64_t c) {
-    if (gGp->physical) ledsShowOptions(f, d, c);
-}
-
-// Blink a set of squares - only on the board owner.
-inline void gLedsFlashMask(uint64_t m, CRGB c, uint16_t ms) {
-    if (gGp->physical) ledsFlashMask(m, c, ms);
-}
+inline bool gLedOk() { return gGp->physical && !setupActive(); }
+inline void gLedsClear()                              { if (gLedOk()) ledsClear(); }
+inline void gLedSq(int sq, CRGB c)                    { if (gLedOk()) ledSq(sq, c); }
+inline void gLedsShowLastMove(int a, int b)           { if (gLedOk()) ledsShowLastMove(a, b); }
+inline void gLedsShowOptions(int f, uint64_t d, uint64_t c) { if (gLedOk()) ledsShowOptions(f, d, c); }
+inline void gLedsFlashMask(uint64_t m, CRGB c, uint16_t ms) { if (gLedOk()) ledsFlashMask(m, c, ms); }
 
 // Recompute everything that depends on the position: legal moves and the expected sensor pattern.
 inline void gameRecalc() {
@@ -186,6 +170,8 @@ inline void gameApply(const cr::Move& moveRef, bool remote) {
         strcpy(G.result, "Draw - stalemate");
     }
     G.syncing = G.physical && (boardOccupancy() != G.expected);
+    if (G.physical && !G.syncing && !setupActive() && !gReplay) lastBoardSave(G.pos);   // board really shows this position
+    if (G.physical && G.over && !G.syncing) lastBoardFlush();                           // game end (only when the final position is really on the board)
     G.wrongActive = false;
     G.mismatchSince = 0;
     G.promoPending = false;
@@ -249,9 +235,11 @@ inline int gameApplyMovesStr(const char* moves) {
         if (!cr::fromUci(G.pos, tok[i], &m)) break;
         bool mine = (G.pos.white == G.myWhite) && G.mode == GM_ONLINE;  // our own move echoed back: board already matches
         bool silent = mine && boardOccupancy() == cr::occupancyAfter(G.pos, m);
+        gReplay = (i < n - 1);                 // intermediate plies never touch the saved board map
         gameApply(m, !silent);
         applied++;
     }
+    gReplay = false;
     return applied;
 }
 
@@ -349,6 +337,31 @@ inline void gamePuzzleRewind() {
     gLedsShowLastMove(G.lastSubmitted.to, G.lastSubmitted.from);  // reversed colours = "put it back"
 }
 
+// Pass & play undo: go back one ply. The board still shows the undone move, so the LEDs say "put it back".
+// The saved board map is NOT touched here (the physical board did not change); it is saved when the user has mirrored it.
+inline void gameUndo() {
+    if (!G.nHist) return;
+    G.nHist--;
+    cr::Move u = G.hist[G.nHist];
+    G.over = false;
+    G.result[0] = 0;
+    G.pos = G.start;
+    for (int i = 0; i < G.nHist; i++) cr::makeMove(G.pos, G.hist[i]);
+    G.lastFrom = G.nHist ? G.hist[G.nHist - 1].from : -1;
+    G.lastTo = G.nHist ? G.hist[G.nHist - 1].to : -1;
+    G.wrongActive = false;
+    G.mismatchSince = 0;
+    G.promoPending = G.promoByTouch = false;
+    G.emptied = 0;
+    gameClearSel();
+    gameRecalc();
+    G.syncing = G.physical && (boardOccupancy() != G.expected);
+    gLedsClear();
+    if (G.syncing) gLedsShowLastMove(u.to, u.from);   // reversed colours = "put it back"
+    else gLedsShowLastMove(G.lastFrom, G.lastTo);
+    DBG(GAME, "slot%d UNDO -> ply=%d syncing=%d", (int)G.slot, (int)G.nHist, (int)G.syncing);
+}
+
 // ---- who owns the physical board ----
 // Give the physical board (sensors + LEDs) to one game; every other game becomes display-only.
 inline void gameClaimBoard(int slot) {
@@ -362,8 +375,14 @@ inline void gameClaimBoard(int slot) {
     }
     GS[slot].physical = true;
     GS[slot].promoPending = false;
+    GS[slot].wrongActive = false;              // stale state from before the setup
+    GS[slot].mismatchSince = 0;
+    GS[slot].emptied = 0;
+    GS[slot].selFrom = -1;
+    GS[slot].selDest = GS[slot].selCap = 0;
     GameScope sc(slot);
     G.syncing = (boardOccupancy() != G.expected);
+    DBG(GAME, "slot%d claimed the board: syncing=%d (sensors=%d expected=%d)", slot, (int)G.syncing, __builtin_popcountll(boardOccupancy()), __builtin_popcountll(G.expected));
     gLedsClear();
     if (G.lastFrom >= 0 || G.syncing) gLedsShowLastMove(G.lastFrom, G.lastTo);
 }
@@ -420,7 +439,8 @@ inline GEvt gameTouchSquare(int sq) {
 // ---- sensors ----
 // Feed the sensor pattern: detects lifted pieces, finished moves, castling, promotion and wrong moves.
 inline GEvt gameSensorTick(uint64_t occ) {
-    if (G.mode == GM_NONE || G.mode == GM_REVIEW || !G.physical || G.over) return GE_NONE;
+    // G.over does NOT return here: a finished game still waits until its last move is mirrored on the board
+    if (G.mode == GM_NONE || G.mode == GM_REVIEW || !G.physical || setupActive()) return GE_NONE;
     uint32_t now = millis();
     if (occ == G.expected) {
         G.mismatchSince = 0;
@@ -429,7 +449,16 @@ inline GEvt gameSensorTick(uint64_t occ) {
         if (!G.promoByTouch) G.promoPending = false;  // piece put back => promotion cancelled
         bool was = G.syncing;
         G.syncing = false;
-        if (was) DBG(GAME, "slot%d board in sync with the game", (int)G.slot);
+        if (was) {
+            DBG(GAME, "slot%d board in sync with the game", (int)G.slot);
+            lastBoardSave(G.pos);
+            if (G.over) {                      // final position is now really on the board
+                lastBoardFlush();
+                gLedsClear();
+                G.physical = false;
+                DBG(GAME, "slot%d finished game mirrored, board released, final position saved", (int)G.slot);
+            }
+        }
         if (G.selFrom >= 0) {
             gameClearSel();
             gameShowHints();
@@ -440,7 +469,7 @@ inline GEvt gameSensorTick(uint64_t occ) {
         }
         return GE_NONE;
     }
-    if (G.syncing) return GE_NONE;  // user is mirroring a move: LEDs guide, no nagging
+    if (G.syncing || G.over) return GE_NONE;  // user is mirroring a move: LEDs guide, no nagging
     bool myTurn = gameCanMoveNow();
     uint64_t added = occ & ~G.expected, lifted = G.expected & ~occ;
     G.emptied |= lifted;
@@ -493,4 +522,11 @@ inline GEvt gameSensorTick(uint64_t occ) {
         G.wrongActive = false;
     }
     return GE_NONE;
+}
+
+// Setup target = the position of an existing game slot (resume an ongoing game).
+inline bool setupTargetFromGame(int slot, cr::Position& out) {
+    if (!GS || slot < 0 || slot > 2 || GS[slot].mode == GM_NONE) return false;
+    out = GS[slot].pos;
+    return true;
 }

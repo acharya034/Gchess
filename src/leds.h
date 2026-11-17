@@ -54,6 +54,12 @@ inline void ledsClear() {
     ledDirty = true;
 }
 
+// Stop all flashing overlays (ledsClear() only clears the base layer).
+inline void ledsClearOverlay() {
+    memset(ledOverlayUntil, 0, sizeof(ledOverlayUntil));
+    ledDirty = true;
+}
+
 inline void ledSq(int sq, CRGB c) {
     if (sq >= 0 && sq < 64) { ledLayer[sq] = c; ledDirty = true; }
 }
@@ -71,8 +77,8 @@ inline void ledsFlashMask(uint64_t m, CRGB c, uint16_t ms) {
 }
 
 inline void ledsShowLastMove(int from, int to) {
-    if (from >= 0) ledSq(from, CRGB(0, 70, 255));
-    if (to >= 0)   ledSq(to,   CRGB(0, 255, 60));
+    if (from >= 0) ledSq(from, CRGB(120, 65, 0));   // Soft Amber (From)
+    if (to >= 0)   ledSq(to,   CRGB(0, 180, 255));  // Bright Cyan (To)
 }
 
 inline void ledsShowOptions(int from, uint64_t dest, uint64_t caps) {
@@ -89,17 +95,22 @@ inline void ledsRainbowTest() {
 
 inline void ledsTick() {
     uint32_t now = millis();
+    static uint8_t lastPhase = 0;
+    bool anyFlash = false;
     for (int i = 0; i < 64; i++)
-        if (ledOverlayUntil[i] && now > ledOverlayUntil[i]) {
-            ledOverlayUntil[i] = 0;
-            ledDirty = true;
+        if (ledOverlayUntil[i]) {
+            if (now > ledOverlayUntil[i]) { ledOverlayUntil[i] = 0; ledDirty = true; }
+            else anyFlash = true;
         }
+    uint8_t phase = (now / 120) & 1;
+    if (anyFlash && phase != lastPhase) ledDirty = true;   // make the blink animate
+    lastPhase = phase;
     if (!ledDirty || now - ledLastShow < 16) return;
     ledDirty = false;
     ledLastShow = now;
     for (int sq = 0; sq < 64; sq++) {
         CRGB c = ledOverlayUntil[sq] ? ledOverlay[sq] : ledLayer[sq];
-        if (ledOverlayUntil[sq] && ((now / 120) & 1)) c = CRGB::Black;
+        if (ledOverlayUntil[sq] && phase) c = CRGB::Black;
         leds[sqToLed(sq)] = c;
     }
     FastLED.show();

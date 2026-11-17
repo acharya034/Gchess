@@ -37,6 +37,7 @@ enum PageId : uint8_t {
     PG_BOARDTEST,
     PG_ABOUT,
     PG_ONGOING,
+    PG_SETUP,      
     PG_COUNT
 };
 enum TouchPhase : uint8_t {
@@ -73,6 +74,7 @@ static uint8_t gSp = 0;
 static int8_t gNetState = 0, gRssi = 0;
 static bool (*gGlobalEvt)(const UiEvt&) = nullptr;
 static bool (*gLeaveGuard)(bool toHome) = nullptr;  // asked before leaving the game page (return true = I handle it)
+static bool (*gOnFlipHw)() = nullptr;   // called after gSet.flipHw changed; returns true when it opened the setup page
 static bool gScreenOff = false;
 static bool gSwallow = false;  // ignore the rest of a touch that just closed a menu or woke the screen
 static uint32_t gLastTouch = 0;
@@ -839,6 +841,10 @@ inline void qmTouch(TouchPhase ph, int x, int y) {
                 uiBack();
                 break;
                 case 6: gSet.flipHw = !gSet.flipHw;
+                storageSaveSettings();
+                gModal = MD_NONE;
+                if (gOnFlipHw && gOnFlipHw()) break;     // setup page took over
+                gModal = MD_QUICK;
                 qmDraw();
                 break;
                 case 7: uiDialog("Power", "", "Restart", "Power off", powerDlgCb);

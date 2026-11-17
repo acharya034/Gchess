@@ -39,6 +39,8 @@
 #include "game.h"
 #include "net.h"
 #include "pages.h"
+#include "setup.h"
+#include <esp_bt.h> // disable Bluetooth to free up memory (we don't use it)
 
 // Drawn by powerOff() just before the board switches itself off.
 static void goodbye() {
@@ -64,10 +66,21 @@ static void hwTask(void*) {
 // User interface task (core 0): about 60 times a second.
 static void uiTask(void*) {
   uint32_t lastReport = 0;
+  const uint32_t bootAt = millis();
   for (;;) {
-    uiTouchPump();     // read the touch screen
-    uiPumpEvents();    // messages from the network, power button, notifications
-    physTick();        // the game that owns the physical board is always watched, on every page
+    uiTouchPump();
+    uiPumpEvents();
+    // Boot check (F): once, after the first debounced sensor frame (+ margin)
+    if (!gBootChecked && boardReady() && millis() - bootAt > (uint32_t)SENSOR_DEBOUNCE * SENSOR_SCAN_MS * 2) {
+      uint64_t o = boardOccupancy();
+      gBootCheck = setupBootCheck(o);
+      gBootChecked = true;
+      DBG(SETUP, "boot check: %d (0=matches, 1=restorable, 2=unknown)  sensors=%d saved=%d diff=%d",
+          (int)gBootCheck, __builtin_popcountll(o), __builtin_popcountll(gLb.occ), __builtin_popcountll(o ^ gLb.occ));
+    }
+    lastBoardTick();
+    if (setupActive()) setupTick(boardOccupancy());
+    else physTick();
     if (!gScreenOff && gModal == MD_NONE && gPages[gCur].tick) gPages[gCur].tick();   // page animations / redraws
 
     // Every 10 seconds: memory report. Falling "min_ever" numbers = a memory leak.
@@ -75,13 +88,14 @@ static void uiTask(void*) {
       lastReport = millis();
       dbgHeap("ui");
       DBG(SYS, "stack left (words): ui=%u hw=? page=%s wifi=%d games(on board)=%d", (unsigned)uxTaskGetStackHighWaterMark(nullptr), gPages[gCur].name, (int)WiFi.status(), (int)(physLive() != nullptr));
-    }
+    } 
     vTaskDelay(pdMS_TO_TICKS(15));
   }
 }
 
 void setup() {
   powerBegin();            // FIRST: hold the power latch so releasing the button does not switch us off
+  esp_bt_controller_disable(); // disable Bluetooth to free up memory (we don't use it)
   dbgBegin();              // Serial monitor at 115200
   DBG(SYS, "==== %s v%s booting, reset reason %d, cpu %d MHz ====", GC_NAME, GC_VERSION, (int)esp_reset_reason(), (int)getCpuFrequencyMhz());
   dbgHeap("boot");
@@ -89,6 +103,7 @@ void setup() {
   storageBegin();          // settings / accounts / Wi-Fi from flash
   analyticsBegin();
   soundBegin();
+  lastBoardLoad();         // saved board map (setup.h)
   ledsBegin();
   boardBegin();
   gfxBegin();              // display + touch (first boot: touch calibration screen)

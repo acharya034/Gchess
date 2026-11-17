@@ -30,6 +30,7 @@
 #include "debug.h"
 #include "sound.h"
 #include "storage.h"
+#include "setup.h"
 #include "analytics.h"
 #include <esp_sleep.h>
 #include <WiFi.h>
@@ -64,16 +65,19 @@ static void (*gBeforeOff)() = nullptr;
 
 // Put the pin back to "idle LOW output" (this is what holds the latch happy).
 inline void powerPinIdle() {
-  digitalWrite(PIN_POWER, LOW);
+  digitalWrite(PIN_POWER, HIGH);
   pinMode(PIN_POWER, OUTPUT);
 }
 
 // Look at the button for a very short moment. Returns true while it is pressed.
 inline bool powerReadButton() {
-  pinMode(PIN_POWER, INPUT_PULLUP);      // let the pin float up (button open = HIGH)
+  pinMode(PIN_POWER, INPUT_PULLDOWN);      // let the pin float up (button open = HIGH)
   delayMicroseconds(PWR_READ_US);        // wait until the wire has reached its level
-  bool pressed = (digitalRead(PIN_POWER) == LOW);
-  powerPinIdle();                        // back to LOW right away
+  bool pressed = (digitalRead(PIN_POWER) == HIGH);
+  powerPinIdle();    
+  // bool down = powerReadButton();
+  // if (pressed) DBG(POWER, "Button state: PRESSED"); else DBG(POWER, "Button state: RELEASED");
+  // DBG(POWER, "Button state: %s", pressed ? "PRESSED" : "RELEASED");                    // back to LOW right away
   return pressed;
 }
 
@@ -130,7 +134,8 @@ inline void batteryService(uint32_t now) {
     case BAT_SETTLE:
       if (now - batT0 >= BAT_SETTLE_MS) {
         uint32_t sum = 0;                     // step 3: read the divider (average of 8)
-        for (int n = 0; n < 8; n++) sum += analogReadMilliVolts(PIN_BAT);
+        // for (int n = 0; n < 8; n++) sum += analogReadMilliVolts(PIN_BAT);
+        sum = 7;
         float v = (sum / 8.0f) * BAT_DIV * BAT_CAL / 1000.0f;
         vbat = (batLast == 0) ? v : vbat * 0.7f + v * 0.3f;   // smooth the value
         batLast = now;
@@ -145,7 +150,8 @@ inline void batteryService(uint32_t now) {
 inline void chargerService(uint32_t now) {
   if (now - chgLast < 1000) return;
   chgLast = now;
-  chgMv = analogReadMilliVolts(PIN_CHG);
+  // chgMv = analogReadMilliVolts(PIN_CHG);
+  chgMv = 0; // --- IGNORE ---
   ChargeState s = CHG_NONE;
   if (chgMv >= CHG_MV_CHARGING_MIN) s = CHG_CHARGING;
   else if (chgMv >= CHG_MV_FULL_MIN) s = CHG_FULL;
@@ -159,8 +165,8 @@ inline void chargerService(uint32_t now) {
 inline void powerBegin() {
   powerPinIdle();                             // hold the latch
   analogReadResolution(12);
-  analogSetPinAttenuation(PIN_BAT, ADC_11db); // measure up to ~3.1 V at the pin
-  analogSetPinAttenuation(PIN_CHG, ADC_11db);
+  // analogSetPinAttenuation(PIN_BAT, ADC_11db); // measure up to ~3.1 V at the pin
+  // analogSetPinAttenuation(PIN_CHG, ADC_11db);
   pinMode(PIN_CHG, INPUT);
   pinMode(PIN_BAT, INPUT);
 }
@@ -172,9 +178,11 @@ inline void powerBegin() {
   soundPlay(SND_POWER_OFF);
   analyticsEvent("power_off");
   analyticsFlush();
+  if (setupActive() && lastBoardValid() && boardOccupancy() != gLb.occ) lastBoardInvalidate();   // setup was half done: the saved map is no longer true
+  lastBoardFlush();                           // saved board survives the power cut
   storageSaveAll();                           // data is safe now
   WiFi.disconnect(true, false);
-
+  
   uint32_t t = millis();
   while (millis() - t < 900) {                // let the goodbye melody play
     soundTick();
@@ -182,18 +190,24 @@ inline void powerBegin() {
   }
   while (powerReadButton()) delay(10);        // wait until the button is released (a pressed button holds the latch on)
 
-  digitalWrite(PIN_POWER, HIGH);              // the "off" signal
-  delay(300);                                 // on battery power we die here
+  digitalWrite(PIN_POWER, LOW);              // the "off" signal
+  delay(300); 
+  
+  while (true) {
+    delay(1000);
+  }// on battery power we die here
 
   // Still alive => powered by USB. Sleep until the button is pressed again.
-  pinMode(PIN_POWER, INPUT);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_POWER, 0);
-  esp_deep_sleep_start();
+  // pinMode(PIN_POWER, INPUT_PULLDOWN);
+  // esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_POWER, 0);
+  // esp_deep_sleep_start();
 }
 
 [[noreturn]] inline void powerRestart() {
   DBG(POWER, "restarting");
   analyticsFlush();
+  if (setupActive() && lastBoardValid() && boardOccupancy() != gLb.occ) lastBoardInvalidate();   // setup was half done: the saved map is no longer true
+  lastBoardFlush();                           // saved board survives the power cut
   storageSaveAll();
   delay(100);
   ESP.restart();

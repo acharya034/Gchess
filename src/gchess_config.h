@@ -21,14 +21,15 @@
 //   [   12.345] C1 NET    >> GET https://lichess.org/api/account
 //    time(s)    core cat   message
 #define DBG_TOUCH   0   // every touch down / up / move (moves are rate limited)
-#define DBG_UI      1   // page changes, buttons, menus, dialogs, notifications
+#define DBG_UI      0  // page changes, buttons, menus, dialogs, notifications
 #define DBG_EVT     0   // every message between core 0 (UI) and core 1 (network)
 #define DBG_NET     0   // Wi-Fi, Lichess streams, game slots
 #define DBG_HTTP    0   // full requests and responses (url, headers, body)
-#define DBG_GAME    1   // moves, hints, wrong-move alarms, board ownership
-#define DBG_SENS    1   // hall sensor changes (which squares changed)
-#define DBG_POWER   0   // power button, battery, charger
-#define DBG_SYS     1   // boot info, free memory every 10 s, task stack usage
+#define DBG_GAME    0  // moves, hints, wrong-move alarms, board ownership
+#define DBG_SENS    0  // hall sensor changes (which squares changed)
+#define DBG_POWER   1   // power button, battery, charger
+#define DBG_SYS     1  // boot info, free memory every 10 s, task stack usage
+#define DBG_SETUP   0   // board setup engine (put with the other DBG_ flags)
 #define DEBUG_SHOW_SECRETS 0   // 1 = print full Lichess tokens (careful!)
 
 // ---------- Pins (ESP32 DevKit, 30 pin) ---------------------------------------------
@@ -43,7 +44,7 @@
 #define PIN_TOUCH_CS 21
 
 #define PIN_LED_DATA  16   // addressable LEDs (through 330R into LED #0). Keep GPIO0 free of pull-downs.
-#define PIN_BUZZER   22   // passive buzzer
+#define PIN_BUZZER   3   // passive buzzer
 
 // Power: ONE pin does everything (see wiring diagram "Power").
 //   idle  = driven LOW  (keeps the latch happy)
@@ -52,13 +53,13 @@
 #define PIN_POWER     2
 
 // Battery and charger readings (both must be ADC1 pins: 32..39)
-#define PIN_BAT      4   // battery gauge: pulse it HIGH to charge the capacitor, then read it as ADC
-#define PIN_CHG      3   // charger LEDs through two different resistors -> voltage tells the state
+#define PIN_BAT     32  // battery gauge: pulse it HIGH to charge the capacitor, then read it as ADC
+#define PIN_CHG     33 // charger LEDs through two different resistors -> voltage tells the state
 
 
 const int hallpin[3][4] = {
     {13, 12, 14, 27},   // positive lines
-    {26, 25, 33, 32},   // negative lines
+    {26, 25, 4, 22},   // negative lines
     {34, 35, 36, 39}    // data lines: quadrant 0..3 (same order as the working code)
 };
 
@@ -78,7 +79,7 @@ const int hallpin[3][4] = {
 #define LED_MAX_MA     1500
 
 // ---------- Power button timing -------------------------------------------------------
-#define PWR_SAMPLE_MS     5    // how often the button is sampled
+#define PWR_SAMPLE_MS    50    // how often the button is sampled
 #define PWR_READ_US      25    // pull-up window length
 #define BTN_RESTART_MS 2000    // hold this long  -> restart
 #define BTN_OFF_MS     4000    // hold this long  -> power off
@@ -124,3 +125,8 @@ const int hallpin[3][4] = {
 #define WIFI_WEAK_RSSI  (-78)  // below this we look for a better access point
 #define WIFI_RESCAN_MS  20000
 #define WIFI_RETRY_MS   12000
+
+// ---------- Board setup engine ----------
+#define SETUP_MAX_STEPS        32      // longest step list
+#define SETUP_MAX_RESTORE_DIFF 16       // sensors differ from saved board by more than this squares -> UNKNOWN
+#define LASTBRD_MIN_WRITE_MS   5000    // flash write rate limit for the "last board" memory

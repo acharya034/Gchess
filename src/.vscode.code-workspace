@@ -1,0 +1,46 @@
+{
+	"folders": [
+		{
+			"path": "../../.vscode"
+		},
+		{
+			"path": "../../261004-200727-esp32dev"
+		},
+		{
+			"path": "../../arduinoesp32chessenginetest"
+		},
+		{
+			"path": "../../chessenginetest"
+		},
+		{
+			"path": "../../Gchess.com"
+		},
+		{
+			"path": "../../Gchess.com.misslead"
+		},
+		{
+			"path": "../../hall matrix teaster arduino uno"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../Lichess_API"
+		},
+		{
+			"path": "../../smartchess engine test"
+		},
+		{
+			"path": "../../testchessengine"
+		},
+		{
+			"path": "../../tft display teaster"
+		},
+		{
+			"path": "../../TheSmartChessBoard"
+		},
+		{
+			"path": "../../touch input source library"
+		}
+	]
+}

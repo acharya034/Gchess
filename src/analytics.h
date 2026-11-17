@@ -73,7 +73,7 @@ inline void analyticsButton(uint8_t page, const char* name) {
         gAn.bt[free_].count = 1;
     }
 }
-
+ 
 // Count a named event (for example "puzzle_solved") and remember its last value.
 inline void analyticsEvent(const char* name, int32_t value = 0) {
     DBG(UI, "analytics: event '%s' value=%d", name, (int)value);

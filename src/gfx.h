@@ -38,8 +38,8 @@ class LGFX : public lgfx::LGFX_Device {
             auto c = _bus.config();
             c.spi_host = SPI3_HOST;
             c.spi_mode = 0;
-            c.freq_write = 25000000;
-            c.freq_read = 16000000;
+            c.freq_write = 70000000;
+            c.freq_read = 40000000;
             c.spi_3wire = false;
             c.use_lock = true;
             c.dma_channel = SPI_DMA_CH_AUTO;
@@ -163,6 +163,28 @@ inline void dLine(int a, int b, int c_, int d_, uint16_t col) {
 // Arc (used for the smile of the logo).
 inline void dArc(int x, int y, int r0, int r1, float a0, float a1, uint16_t c) {
     D->drawArc(x - gOx, y - gOy, r0, r1, a0, a1, c);
+}
+
+// Arrow from (x1,y1) to (x2,y2): thick shaft + triangular head at (x2,y2).
+// Goes through the sprite offsets like every other d* helper. Anything outside the current sprite is
+// clipped, so one long arrow can be drawn once into each 30x30 square sprite it crosses.
+inline void dArrow(int x1, int y1, int x2, int y2, uint16_t col, int th = 3) {
+    float dx = x2 - x1, dy = y2 - y1;
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < 2.0f) return;
+    float ux = dx / len, uy = dy / len;                // along the arrow
+    float nx = -uy, ny = ux;                           // across the arrow
+    float hl = fminf(th * 3.0f + 3.0f, len * 0.6f);    // head length
+    float hw = th * 1.5f + 2.0f;                       // half width of the head
+    float bx = x2 - ux * hl, by = y2 - uy * hl;        // centre of the head base
+    float h = th / 2.0f;
+    int ax = lroundf(x1 + nx * h), ay = lroundf(y1 + ny * h);
+    int bx1 = lroundf(x1 - nx * h), by1 = lroundf(y1 - ny * h);
+    int cx = lroundf(bx - nx * h), cy = lroundf(by - ny * h);
+    int ex = lroundf(bx + nx * h), ey = lroundf(by + ny * h);
+    dTri(ax, ay, bx1, by1, cx, cy, col);               // shaft = 2 triangles
+    dTri(ax, ay, cx, cy, ex, ey, col);
+    dTri(x2, y2, lroundf(bx + nx * hw), lroundf(by + ny * hw), lroundf(bx - nx * hw), lroundf(by - ny * hw), col);   // head
 }
 
 #define RGB(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
