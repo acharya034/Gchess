@@ -2241,7 +2241,7 @@ static void aboutDraw() {
 
 // OTA page: check for updates, show progress and result.
 static bool otaUiEvent(const UiEvt& e);
-static void otaPageDraw();
+static void otaPageDraw(){}
 static void otaAboutEnter();
 static void otaAboutDraw();
 static void otaAboutTouch(TouchPhase, int, int);
