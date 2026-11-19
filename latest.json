@@ -1,12 +1,12 @@
 {
  "versions": [
   {
-   "v": "1.0.2",
+   "v": "1.0.3",
    "hw": "A",
-   "url": "https://raw.githubusercontent.com/acharya034/Gchess/v1.0/firmware/gchess_1.0.2.bin",
-   "sha256": "0dcf347bbaf2c798895759cfb2c3297ae330141077e5476ca387bedb9e25ba6c",
-   "size": 1409040,
-   "notes": "otapagedraw bug fixing."
+   "url": "https://raw.githubusercontent.com/acharya034/Gchess/v1.0/firmware/gchess_1.0.3.bin",
+   "sha256": "65fa140a1f88cff453c9fb988e7b5c793886487eefbb03150a92ccd9f5f9c5b7",
+   "size": 1416768,
+   "notes": "battery checking and percentage system micro problem solving"
   }
  ]
 }

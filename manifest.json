@@ -1,8 +1,16 @@
 {
   "latest": {
-    "A": "1.0.2"
+    "A": "1.0.3"
   },
   "versions": [
+    {
+      "v": "1.0.3",
+      "hw": "A",
+      "url": "https://raw.githubusercontent.com/acharya034/Gchess/v1.0/firmware/gchess_1.0.3.bin",
+      "sha256": "65fa140a1f88cff453c9fb988e7b5c793886487eefbb03150a92ccd9f5f9c5b7",
+      "size": 1416768,
+      "notes": "battery checking and percentage system micro problem solving"
+    },
     {
       "v": "1.0.2",
       "hw": "A",
