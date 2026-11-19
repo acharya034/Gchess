@@ -782,16 +782,6 @@ static void otaBarDraw() {
     gfxText(120, 228, gOtaTxt, 1, T.dim, TD_TC);
 }
 
-static void otaPageDraw() {
-    tft.fillScreen(T.bg);
-    gfxText(120, 70, "Updating Gchess", 2, T.fg, TD_TC);
-    char s[24];
-    snprintf(s, sizeof(s), "v%s", gOtaTitleVer);
-    gfxText(120, 110, s, 2, T.accent, TD_TC);
-    gfxText(120, 268, "Keep the board powered on", 1, T.dim, TD_TC);
-    otaBarDraw();
-}
-
 #if OTA_SLIM_BOOT
 // Start an update (UI side): remember the job in flash and restart. The download itself runs in otaSlimBoot()
 // right after the restart, when almost all RAM is free (the running firmware has only ~9 KB left with a TLS socket open).
@@ -872,11 +862,12 @@ static bool otaSlimBoot() {
     DBG(SYS, "ota: SLIM BOOT for v%s, free heap %u, largest %u", e.ver, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
     tft.fillScreen(T.bg);
-    logoFull(120, 30);
-    gfxText(120, 120, "Updating firmware", 2, T.accent, TD_TC);
-    char vs[24];
-    snprintf(vs, sizeof(vs), "v%s", e.ver);
-    gfxText(120, 140, vs, 1, T.dim, TD_TC);
+    gfxText(120, 70, "Updating Gchess", 2, T.fg, TD_TC);
+    char s[24];
+    snprintf(s, sizeof(s), "v%s", e.ver);
+    gfxText(120, 110, s, 2, T.accent, TD_TC);
+    gfxText(120, 268, "Keep the board powered on", 1, T.dim, TD_TC);
+    otaBarDraw();
 
     bool ok = false;
     const char* err = "";
