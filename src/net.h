@@ -1415,8 +1415,7 @@ static void netTask(void*) {
     for (;;) {
         NetCmd c;
         while (xQueueReceive(qNet, &c, 0) == pdTRUE) handleCmd(c);
-        wifiTick();
-        if (otaNetTick()) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }   // true while a download runs: all polling below is paused
+        if (!otaIsBusy() || WiFi.status() != WL_CONNECTED) wifiTick();   // no roaming/rescans during an update        if (otaNetTick()) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }   // true while a download runs: all polling below is paused
         if (gLinkOn) linkSrv.handleClient();
         if (gNeedAccount && gLoggedIn && WiFi.status() == WL_CONNECTED) {
             static uint32_t t = 0;

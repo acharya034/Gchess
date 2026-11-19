@@ -72,6 +72,7 @@ enum OtaState : uint8_t { OTA_NONE, OTA_UPTODATE, OTA_OFFER, OTA_INDEX, OTA_PROG
 // implemented in ota.h (included last in Gchess.ino)
 static void otaNetCmd(const NetCmd& c);
 static bool otaNetTick();
+static bool otaIsBusy();
 
 enum ListKind : uint8_t {
     LK_FRIENDS,

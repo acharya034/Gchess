@@ -26,12 +26,12 @@
 #define DBG_TOUCH   0   // every touch down / up / move (moves are rate limited)
 #define DBG_UI      0  // page changes, buttons, menus, dialogs, notifications
 #define DBG_EVT     0   // every message between core 0 (UI) and core 1 (network)
-#define DBG_NET     0   // Wi-Fi, Lichess streams, game slots
+#define DBG_NET     1   // Wi-Fi, Lichess streams, game slots
 #define DBG_HTTP    0   // full requests and responses (url, headers, body)
 #define DBG_GAME    0  // moves, hints, wrong-move alarms, board ownership
 #define DBG_SENS    0  // hall sensor changes (which squares changed)
 #define DBG_POWER   0   // power button, battery, charger
-#define DBG_SYS     0  // boot info, free memory every 10 s, task stack usage
+#define DBG_SYS     1  // boot info, free memory every 10 s, task stack usage
 #define DBG_SETUP   0   // board setup engine (put with the other DBG_ flags)
 #define DEBUG_SHOW_SECRETS 0   // 1 = print full Lichess tokens (careful!)
 

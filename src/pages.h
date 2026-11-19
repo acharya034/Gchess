@@ -2374,7 +2374,6 @@ inline void pagesBegin() {
     gPages[PG_SETTINGS] = {"Settings", nullptr, settingsDraw, settingsTouch, nullptr, nullptr, nullptr, PF_TOOLBAR};
     gPages[PG_WIFI] = {"Wi-Fi", wifiEnter, wifiDraw, wifiTouch, nullptr, nullptr, listEvent, PF_TOOLBAR};
     gPages[PG_BOARDTEST] = {"Board test", nullptr, btDraw, btTouch, btTick, [](){ ledsClear();}, nullptr, PF_TOOLBAR};
-    gPages[PG_ABOUT] = {"About", nullptr, aboutDraw, nullptr, nullptr, nullptr, nullptr, PF_TOOLBAR};
-    gPages[PG_OTA]   = {"Update", nullptr, otaPageDraw, nullptr, nullptr, nullptr, nullptr, 0};
+    gPages[PG_ABOUT] = {"About", otaAboutEnter, otaAboutDraw, otaAboutTouch, nullptr, nullptr, otaAboutEvent, PF_TOOLBAR};    gPages[PG_OTA]   = {"Update", nullptr, otaPageDraw, nullptr, nullptr, nullptr, nullptr, 0};
     gPages[PG_SETUP] = {"Set up", spEnter, spDraw, spTouch, spTick, spLeave, spEvent, PF_TOOLBAR | PF_NOPUSH, spPartial};
 }

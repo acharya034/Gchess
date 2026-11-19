@@ -97,31 +97,56 @@ static void uiTask(void*) {
 
 void setup() {
   powerBegin();            // FIRST: hold the power latch so releasing the button does not switch us off
-  esp_bt_controller_disable(); // disable Bluetooth to free up memory (we don't use it)
   dbgBegin();              // Serial monitor at 115200
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  esp_bt_controller_disable(); // disable Bluetooth to free up memory (we don't use it)
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   DBG(SYS, "==== %s v%s booting, reset reason %d, cpu %d MHz ====", GC_NAME, GC_VERSION, (int)esp_reset_reason(), (int)getCpuFrequencyMhz());
   dbgHeap("boot");
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   storageBegin();          // settings / accounts / Wi-Fi from flash
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   otaBegin();              // ota_skip / ota_pend / rollback state
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   analyticsBegin();
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   soundBegin();
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   lastBoardLoad();         // saved board map (setup.h)
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   ledsBegin();
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   boardBegin();
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   gfxBegin();              // display + touch (first boot: touch calibration screen)
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   gBeforeOff = goodbye;
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   // Queues and the mutex that protect data shared by the two cores
   qNet = xQueueCreate(16, sizeof(NetCmd));
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   qUi = xQueueCreate(24, sizeof(UiEvt));
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   gNetMux = xSemaphoreCreateMutex();
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  memset(gNetG, 0, sizeof(gNetG));
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  memset(&gNetX, 0, sizeof(gNetX));
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+
   memset(gNetG, 0, sizeof(gNetG));
   memset(&gNetX, 0, sizeof(gNetX));
 
+  otaSlimBoot();           // runs a pending update, never returns when one is stored
+
   gamesInit();             // allocate the 3 game slots
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   pagesBegin();            // register every page
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   if (!gSet.wifiOn) netCmd(NC_WIFI_ENABLE, "", "", 0);
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   // Start on the intro page
   gCur = PG_INTRO;
@@ -130,8 +155,11 @@ void setup() {
   gPages[PG_INTRO].draw();
 
   netBegin();                                                          // core 1
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   xTaskCreatePinnedToCore(hwTask, "hw", 4096, nullptr, 4, nullptr, 0); // core 0, high priority
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   xTaskCreatePinnedToCore(uiTask, "ui", 8192, nullptr, 3, nullptr, 0);
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   dbgHeap("after start");
 }
 

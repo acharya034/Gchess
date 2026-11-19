@@ -26,26 +26,50 @@
 #ifndef OTA_MAX_ENTRIES
 #define OTA_MAX_ENTRIES 10          // manifest entries kept in RAM (only hw == GC_HW)
 #endif
+#ifndef OTA_LATEST_MAX
+#define OTA_LATEST_MAX 2048         // latest.json is tiny (one entry per hardware line)
+#endif
 #ifndef OTA_MANIFEST_MAX
-#define OTA_MANIFEST_MAX 8192       // bytes of manifest we are willing to read
+#define OTA_MANIFEST_MAX 4096       // full list buffer (about 11 versions); taken before TLS starts, so keep it small
 #endif
 #ifndef OTA_TIMEOUT_MS
 #define OTA_TIMEOUT_MS 15000        // connect / handshake / response-header timeout
 #endif
 #ifndef OTA_STALL_MS
-#define OTA_STALL_MS 20000          // no download bytes for this long -> abort
+#define OTA_STALL_MS 12000          // no download bytes for this long -> abort
 #endif
 #ifndef OTA_TOTAL_MS
 #define OTA_TOTAL_MS 600000UL       // whole download must finish within 10 minutes
 #endif
+#ifndef OTA_CONNECT_MS
+#define OTA_CONNECT_MS 8000         // one TCP connect attempt (GitHub from some networks times out now and then)
+#endif
+#ifndef OTA_CONNECT_TRIES
+#define OTA_CONNECT_TRIES 4         // attempt 0 = normal DNS name, 1..3 = the other GitHub raw addresses 185.199.109/110/111.133
+#endif
+#ifndef OTA_GIVEUP_MS
+#define OTA_GIVEUP_MS 60000UL       // no new bytes for this long (all reconnects included) -> give up and keep the old firmware
+#endif
+#ifndef OTA_SLIM_BOOT
+#define OTA_SLIM_BOOT 1             // 1 = an update restarts into a slim boot (no game/UI/net tasks, ~100 KB more free heap), 0 = update while running
+#endif
+#ifndef OTA_MAX_RESUMES
+#define OTA_MAX_RESUMES 40          // reconnect + continue (HTTP Range) this many times before giving up
+#endif
 #ifndef OTA_MAX_REDIRECTS
 #define OTA_MAX_REDIRECTS 4
 #endif
+// Measured on the real board: only ~63 KB of heap is free even with NO socket open, and the Lichess TLS
+// connection works at that level. So the limits are low; if the TLS connect really runs out of memory the
+// download fails safely ("Low memory") and the running firmware stays untouched.
+#ifndef OTA_CHECK_MIN_HEAP
+#define OTA_CHECK_MIN_HEAP 50000    // free heap needed for the small latest.json / manifest check
+#endif
 #ifndef OTA_MIN_HEAP
-#define OTA_MIN_HEAP 70000          // free heap needed to start a download (TLS ~45 KB + Update buffer + HTTP objects)
+#define OTA_MIN_HEAP 52000          // free heap needed to start a download
 #endif
 #ifndef OTA_MIN_BLOCK
-#define OTA_MIN_BLOCK 45000         // largest free block needed (TLS buffers are big contiguous allocations)
+#define OTA_MIN_BLOCK 20000         // largest free block needed (TLS buffers are contiguous allocations)
 #endif
 #ifndef OTA_VALID_AFTER_MS
 #define OTA_VALID_AFTER_MS 10000    // Wi-Fi connected this long -> new firmware is marked valid
@@ -129,6 +153,8 @@ static bool gOtaPend = false;               // mirror of NVS "ota_pend"
 // ============================================================================================
 //                                       NET SIDE  (core 1)
 // ============================================================================================
+static char gOtaLastErr[40] = "";           // last failure text (used by the slim update boot)
+static volatile bool gOtaInstalled = false;  // set when Update.end() succeeded
 static volatile bool gOtaBusy = false;      // a download is running: netTask skips all polling (see hook)
 static bool gOtaNeedValid = false;          // running image is PENDING_VERIFY
 static uint32_t gOtaWifiUpAt = 0;           // millis() of the Wi-Fi connect edge, 0 = not connected
@@ -148,7 +174,9 @@ static void otaTlsSetup(WiFiClientSecure& c) {
 struct OtaConn {
     WiFiClientSecure* cl = nullptr;
     HTTPClient* http = nullptr;
-    bool open(const char* url) {
+    bool preFailed = false;                                    // explicit-IP connect failed: do not call GET
+    bool open(const char* url, int attempt = 0) {
+        preFailed = false;
         cl = new (std::nothrow) WiFiClientSecure();
         http = new (std::nothrow) HTTPClient();
         if (!cl || !http) {
@@ -157,7 +185,7 @@ struct OtaConn {
         }
         otaTlsSetup(*cl);
         cl->setTimeout(OTA_TIMEOUT_MS / 1000);
-        http->setConnectTimeout(OTA_TIMEOUT_MS);
+        http->setConnectTimeout(OTA_CONNECT_MS);
         http->setTimeout(OTA_TIMEOUT_MS);
         http->setReuse(false);
         http->setUserAgent("Gchess/" GC_VERSION);
@@ -166,6 +194,12 @@ struct OtaConn {
         if (!http->begin(*cl, url)) {
             close();
             return false;
+        }
+        // Retry with another GitHub address: connect first, HTTPClient then reuses the connected socket (Host header stays the real name).
+        if (attempt > 0 && attempt < 4 && strstr(url, "://raw.githubusercontent.com/")) {
+            IPAddress ip(185, 199, 108 + attempt, 133);
+            DBG(NET, "ota: retry %d via %s", attempt, ip.toString().c_str());
+            if (!cl->connect(ip, 443, OTA_CONNECT_MS)) preFailed = true;
         }
         return true;
     }
@@ -310,24 +344,49 @@ struct OtaSink : public Stream {
 };
 
 // HTTPS GET of "url" (LATEST_URL = newest only, MANIFEST_URL = full history) into gOtaMan.  Blocks up to the timeouts.
-static bool otaFetchManifest(const char* url, char* err, size_t en) {
+// Log what DNS says for the host of a URL (a failing connect is often a DNS / routing problem, not memory).
+static void otaLogDns(const char* url) {
+    const char* h = strstr(url, "://");
+    h = h ? h + 3 : url;
+    char host[64];
+    size_t n = 0;
+    while (h[n] && h[n] != '/' && h[n] != ':' && n < sizeof(host) - 1) { host[n] = h[n]; n++; }
+    host[n] = 0;
+    IPAddress ip;
+    uint32_t t0 = millis();
+    int r = WiFi.hostByName(host, ip);
+    DBG(NET, "ota: DNS %s -> %s (ok=%d, %lu ms, dns server %s, free heap %u)", host, ip.toString().c_str(), r, (unsigned long)(millis() - t0), WiFi.dnsIP().toString().c_str(), (unsigned)ESP.getFreeHeap());
+}
+
+static bool otaFetchManifest(const char* url, size_t cap, char* err, size_t en) {
+    otaLogDns(url);
+    // The body buffer is taken BEFORE the TLS session exists: afterwards the heap has no room left for it.
+    char* buf = (char*)malloc(cap + 1);
+    if (!buf) {
+        strlcpy(err, "Out of memory (buffer)", en);
+        return false;
+    }
     OtaConn c;
     if (!c.open(url)) {
-        strlcpy(err, "Out of memory", en);
+        free(buf);
+        strlcpy(err, "Out of memory (open)", en);
         return false;
     }
     bool ok = false;
-    int code = c.http->GET();
+    int code = -1;
+    for (int k = 0; k < OTA_CONNECT_TRIES; k++) {
+        if (k && (c.close(), !c.open(url, k))) break;
+        code = c.preFailed ? -1 : c.http->GET();
+        DBG(NET, "ota: GET (try %d) -> %d (%s)", k, code, HTTPClient::errorToString(code).c_str());
+        if (code != -1) break;
+    }
     if (code != 200) {
         otaHttpErr(code, err, en);
-    } else if (c.http->getSize() > (int)OTA_MANIFEST_MAX) {
+    } else if (c.http->getSize() > (int)cap) {
         strlcpy(err, "Manifest too big", en);
     } else {
-        char* buf = (char*)malloc(OTA_MANIFEST_MAX + 1);
-        if (!buf) {
-            strlcpy(err, "Out of memory", en);
-        } else {
-            OtaSink sink(buf, OTA_MANIFEST_MAX);
+        {
+            OtaSink sink(buf, cap);
             int w = c.http->writeToStream(&sink);
             if (w < 0 || sink.over) {
                 strlcpy(err, "Manifest read failed", en);
@@ -336,10 +395,10 @@ static bool otaFetchManifest(const char* url, char* err, size_t en) {
                 ok = otaParseManifest(buf);
                 if (!ok) strlcpy(err, "Bad manifest", en);
             }
-            free(buf);
         }
     }
     c.close();
+    free(buf);
     DBG(NET, "ota: manifest %s (%d entries for hw %s) %s", ok ? "ok" : "FAILED", (int)gOtaN, GC_HW, ok ? "" : err);
     return ok;
 }
@@ -365,9 +424,9 @@ static void otaManualCheck() {
     char err[40];
     if (WiFi.status() != WL_CONNECTED) return otaPostCheckFail("No Wi-Fi connection");
     if (anyGameActive()) return otaPostCheckFail("Online game in progress");
-    if (ESP.getFreeHeap() < TLS_MIN_FREE_HEAP) hReq.close();
-    if (ESP.getFreeHeap() < TLS_MIN_FREE_HEAP) return otaPostCheckFail("Low memory");
-    if (!otaFetchManifest(MANIFEST_URL, err, sizeof(err))) return otaPostCheckFail(err);
+    if (ESP.getFreeHeap() < OTA_CHECK_MIN_HEAP) hReq.close();
+    if (ESP.getFreeHeap() < OTA_CHECK_MIN_HEAP) return otaPostCheckFail("Low memory");
+    if (!otaFetchManifest(MANIFEST_URL, OTA_MANIFEST_MAX, err, sizeof(err))) return otaPostCheckFail(err);
     if (!gOtaN) return otaPostCheckFail("No versions published");
 
     ListData& L = gList[LK_OTA];
@@ -392,9 +451,10 @@ static void otaManualCheck() {
 struct OtaRun {
     OtaConn conn;
     OtaEntry e;
-    uint32_t total = 0, got = 0, lastData = 0, startedAt = 0;
+    uint32_t total = 0, got = 0, lastData = 0, startedAt = 0, lastBytesAt = 0;
     int lastPct = -1;
     bool updBegun = false, shaInit = false;
+    uint8_t attempt = 0, resumes = 0;                   // which GitHub address works, how often we reconnected
     mbedtls_sha256_context sha;
 };
 static OtaRun gOtaR;
@@ -409,6 +469,7 @@ static void otaCleanup() {
 
 // Any failure: keep the current firmware, never reboot, resume polling.
 static void otaFail(const char* txt) {
+    strlcpy(gOtaLastErr, txt, sizeof(gOtaLastErr));
     if (gOtaR.updBegun) {
         Update.abort();
         gOtaR.updBegun = false;
@@ -439,13 +500,73 @@ static void otaFinish() {
         DBG(NET, "ota: Update.end failed: %s", Update.errorString());
         otaCleanup();
         gOtaBusy = false;
+        strlcpy(gOtaLastErr, "Image rejected", sizeof(gOtaLastErr));
         otaPostErr("Image rejected", r.e.ver);
         return;
     }
     otaCleanup();
     gOtaBusy = false;
+    gOtaInstalled = true;
     DBG(NET, "ota: v%s installed, boot partition switched", r.e.ver);
     uiPost(UE_OTA, r.e.ver, "Installed", OTA_DONE, 100);
+}
+
+// Open the firmware stream starting at byte "from" (0 = whole file, otherwise HTTP Range resume).
+// Tries several GitHub addresses.  On failure it calls otaFail() itself and returns false.
+static bool otaOpenStream(uint32_t from) {
+    OtaRun& r = gOtaR;
+    int code = -1;
+    for (int k = 0; k < OTA_CONNECT_TRIES; k++) {
+        int att = (r.attempt + k) % OTA_CONNECT_TRIES;
+        r.conn.close();
+        if (WiFi.status() != WL_CONNECTED) {
+            otaFail("Wi-Fi lost");
+            return false;
+        }
+        if (!r.conn.open(r.e.url, att)) {
+            otaFail("Out of memory");
+            return false;
+        }
+        if (from) {
+            char h[32];
+            snprintf(h, sizeof(h), "bytes=%u-", (unsigned)from);
+            r.conn.http->addHeader("Range", h);
+        }
+        code = r.conn.preFailed ? -1 : r.conn.http->GET();
+        DBG(NET, "ota: download GET from=%u (address %d) -> %d (%s)", (unsigned)from, att, code, HTTPClient::errorToString(code).c_str());
+        if (code != -1) {
+            r.attempt = att;
+            break;
+        }
+    }
+    if (from && code == 200) {
+        otaFail("Server cannot resume");
+        return false;
+    }
+    if (code != (from ? 206 : 200)) {
+        char m[40];
+        otaHttpErr(code, m, sizeof(m));
+        otaFail(m);
+        return false;
+    }
+    if (r.conn.http->getSize() != (int)(r.total - from)) {
+        otaFail("Size mismatch");
+        return false;
+    }
+    r.lastData = millis();
+    return true;
+}
+
+// The connection died or stalled: reconnect and continue where we stopped. The flash and the SHA-256 simply carry on.
+static void otaResume(const char* why) {
+    OtaRun& r = gOtaR;
+    if (++r.resumes > OTA_MAX_RESUMES) return otaFail("Network too unstable");
+    if (millis() - r.lastBytesAt > OTA_GIVEUP_MS) return otaFail("No data for 60 s - weak network");
+    DBG(NET, "ota: %s at %u/%u bytes -> resume %d/%d (free heap %u, largest %u)", why, (unsigned)r.got, (unsigned)r.total, (int)r.resumes, OTA_MAX_RESUMES, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    char rt[24];
+    snprintf(rt, sizeof(rt), "Reconnecting %d", (int)r.resumes);
+    uiPost(UE_OTA, r.e.ver, rt, OTA_PROGRESS, r.lastPct < 0 ? 0 : r.lastPct);
+    otaOpenStream(r.got);
 }
 
 // One slice (~25 ms) of the download.  Called from otaNetTick() every netTask loop.
@@ -459,8 +580,8 @@ static void otaDlStep() {
     while (millis() - t0 < 25) {
         int av = s->available();
         if (av <= 0) {
-            if (!s->connected()) return otaFail("Connection lost");
-            if (millis() - r.lastData > OTA_STALL_MS) return otaFail("Download stalled");
+            if (!s->connected()) return otaResume("Connection lost");
+            if (millis() - r.lastData > OTA_STALL_MS) return otaResume("Download stalled");
             break;
         }
         size_t want = (size_t)av;
@@ -474,7 +595,7 @@ static void otaDlStep() {
         }
         mbedtls_sha256_update(&r.sha, buf, (size_t)n);
         r.got += (uint32_t)n;
-        r.lastData = millis();
+        r.lastData = r.lastBytesAt = millis();
         if (r.got >= r.total) return otaFinish();
     }
     int pct = (int)(((uint64_t)r.got * 100) / r.total);
@@ -499,7 +620,7 @@ static void otaStartDownload(int idx, const char* ver) {
     r.lastPct = -1;
     r.updBegun = false;
     r.shaInit = false;
-    r.startedAt = r.lastData = millis();
+    r.startedAt = r.lastData = r.lastBytesAt = millis();
 
     gOtaBusy = true;                                    // pause all polling in netTask
     hReq.close();                                       // give the ~45 KB of the kept-alive socket back
@@ -512,19 +633,19 @@ static void otaStartDownload(int idx, const char* ver) {
     }
     const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
     if (!next || r.total > next->size) return otaFail("Image too big");
-    if (!r.conn.open(r.e.url)) return otaFail("Out of memory");
-    int code = r.conn.http->GET();
-    if (code != 200) {
-        char m[40];
-        otaHttpErr(code, m, sizeof(m));
-        return otaFail(m);
-    }
-    if (r.conn.http->getSize() != (int)r.total) return otaFail("Size mismatch");
+    // Update.begin() first: it needs a 4 KB buffer, and once the TLS session is open the largest free block is only ~3 KB.
     if (!Update.begin(r.total, U_FLASH)) {                // writes to the inactive slot
-        DBG(NET, "ota: Update.begin failed: %s", Update.errorString());
-        return otaFail("Cannot start flash write");
+        const esp_partition_t* run = esp_ota_get_running_partition();
+        DBG(NET, "ota: Update.begin failed: %s (code %u) bin=%u next=%s/%u running=%s/%u free heap %u largest %u", Update.errorString(), (unsigned)Update.getError(), (unsigned)r.total,
+            next ? next->label : "none", next ? (unsigned)next->size : 0, run ? run->label : "none", run ? (unsigned)run->size : 0, (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        char fm[40];
+        snprintf(fm, sizeof(fm), "Flash start: %s", Update.errorString());
+        return otaFail(fm);
     }
-    r.updBegun = true;
+    r.updBegun = true;                                     // from here every failure path aborts the update (otaFail)
+    r.attempt = 0;
+    r.resumes = 0;
+    if (!otaOpenStream(0)) return;                         // otaFail() was already called
     mbedtls_sha256_init(&r.sha);
     mbedtls_sha256_starts(&r.sha, 0);
     r.shaInit = true;
@@ -538,6 +659,9 @@ static void otaNetCmd(const NetCmd& c) {
 
 // Called by netTask right after wifiTick().  Returns true while a download runs: the caller then skips
 // everything else (accounts, polling, streams, housekeeping) for this loop.
+static bool otaIsBusy() { return gOtaBusy; }
+
+// Called by netTask right after wifiTick() (see above).
 static bool otaNetTick() {
     uint32_t now = millis();
     bool conn = WiFi.status() == WL_CONNECTED;
@@ -564,11 +688,13 @@ static bool otaNetTick() {
     }
 
     if (conn && gOtaManifestDue && (int32_t)(now - gOtaNextTry) >= 0) {
-        if (anyGameActive() || ESP.getFreeHeap() < TLS_MIN_FREE_HEAP) {
+        if (!anyGameActive() && ESP.getFreeHeap() < OTA_CHECK_MIN_HEAP) hReq.close();   // give back the kept-alive Lichess socket first
+        if (anyGameActive() || ESP.getFreeHeap() < OTA_CHECK_MIN_HEAP) {
+            DBG(NET, "ota: check deferred (game=%d, free heap %u, need %u)", (int)anyGameActive(), (unsigned)ESP.getFreeHeap(), (unsigned)OTA_CHECK_MIN_HEAP);
             gOtaNextTry = now + 15000;                   // not now: retry when idle
         } else {
             char err[40];
-            if (otaFetchManifest(LATEST_URL, err, sizeof(err))) {
+            if (otaFetchManifest(LATEST_URL, OTA_LATEST_MAX, err, sizeof(err))) {
                 gOtaManifestDue = false;
                 gOtaOfferDue = true;
             } else if (++gOtaTries >= OTA_MANIFEST_TRIES) {
@@ -666,6 +792,24 @@ static void otaPageDraw() {
     otaBarDraw();
 }
 
+#if OTA_SLIM_BOOT
+// Start an update (UI side): remember the job in flash and restart. The download itself runs in otaSlimBoot()
+// right after the restart, when almost all RAM is free (the running firmware has only ~9 KB left with a TLS socket open).
+static void otaStart(int idx, const char* ver, uint8_t after) {
+    if (gOtaRun) return;
+    if (WiFi.status() != WL_CONNECTED) { uiToast("No Wi-Fi connection"); return; }
+    if (!otaPowerOk()) { uiToast("Battery too low for update"); return; }
+    if (idx < 0 || idx >= gOtaN || strcmp(gOtaMan[idx].ver, ver) != 0) { uiToast("Version list changed"); return; }
+    gPrefs.putBytes("ota_ent", &gOtaMan[idx], sizeof(OtaEntry));
+    gPrefs.putUChar("ota_after", after);
+    gPrefs.putBool("ota_job", true);
+    otaSetPend(false);
+    DBG(SYS, "ota: job saved for v%s, restarting into the slim update boot", ver);
+    uiToast("Restarting to update...");
+    delay(300);
+    powerRestart();
+}
+#else
 // Start an update (UI side): show the progress page, then ask the net task.
 static void otaStart(int idx, const char* ver, uint8_t after) {
     if (gOtaRun) return;
@@ -680,6 +824,109 @@ static void otaStart(int idx, const char* ver, uint8_t after) {
     gOtaReturn = (gCur == PG_OTA) ? PG_SETTINGS : gCur;
     uiGo(PG_OTA);
     netCmd(NC_OTA_START, ver, "", idx);
+}
+#endif
+
+// ---------------------------------------------------------------------------------------------
+//  SLIM UPDATE BOOT: call from setup() after the queues exist and BEFORE gamesInit().
+//  Returns false when no update job is stored (normal start). Otherwise it never returns.
+// ---------------------------------------------------------------------------------------------
+static void otaSlimDraw(int pct, const char* txt) {
+    tft.fillRect(0, 150, 240, 140, T.bg);
+    gfxText(120, 156, txt, 1, T.fg, TD_TC);
+    tft.drawRect(20, 190, 200, 16, T.card2);
+    int w = (196 * constrain(pct, 0, 100)) / 100;
+    if (w > 0) tft.fillRect(22, 192, w, 12, T.accent);
+    char s[8];
+    snprintf(s, sizeof(s), "%d%%", pct);
+    gfxText(120, 218, s, 2, T.accent, TD_TC);
+    gfxText(120, 268, "Do not switch off", 1, T.dim, TD_TC);
+}
+
+static bool otaSlimWifi() {
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < MAX_WIFI; i++) {
+            if (!gWifi[i].used) continue;
+            char t[48];
+            snprintf(t, sizeof(t), "Connecting to %.24s...", gWifi[i].ssid);
+            otaSlimDraw(0, t);
+            WiFi.begin(gWifi[i].ssid, gWifi[i].pass);
+            for (uint32_t t0 = millis(); millis() - t0 < 12000;) {
+                if (WiFi.status() == WL_CONNECTED) return true;
+                delay(100);
+            }
+            WiFi.disconnect(false, false);
+        }
+    }
+    return false;
+}
+
+static bool otaSlimBoot() {
+    if (!gPrefs.getBool("ota_job", false)) return false;
+    gPrefs.putBool("ota_job", false);                          // clear FIRST: whatever happens, we never loop in this mode
+    OtaEntry e;
+    if (gPrefs.getBytes("ota_ent", &e, sizeof(e)) != sizeof(e)) return false;
+    uint8_t after = gPrefs.getUChar("ota_after", OTA_AFTER_RESTART);
+    DBG(SYS, "ota: SLIM BOOT for v%s, free heap %u, largest %u", e.ver, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+
+    tft.fillScreen(T.bg);
+    logoFull(120, 30);
+    gfxText(120, 120, "Updating firmware", 2, T.accent, TD_TC);
+    char vs[24];
+    snprintf(vs, sizeof(vs), "v%s", e.ver);
+    gfxText(120, 140, vs, 1, T.dim, TD_TC);
+
+    bool ok = false;
+    const char* err = "";
+    if (!otaSlimWifi()) {
+        err = "Wi-Fi not available";
+    } else {
+        gOtaMan[0] = e;
+        gOtaN = 1;
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+            gOtaInstalled = false;
+            gOtaLastErr[0] = 0;
+            otaSlimDraw(0, attempt ? "Trying again..." : "Connecting to GitHub...");
+            otaStartDownload(0, e.ver);
+            int last = -1;
+            while (gOtaBusy) {
+                otaDlStep();
+                xQueueReset(qUi);                                // nobody reads the UI events in this mode
+                int pct = gOtaR.total ? (int)(((uint64_t)gOtaR.got * 100) / gOtaR.total) : 0;
+                if (pct != last) {
+                    last = pct;
+                    otaSlimDraw(pct, gOtaR.resumes ? "Downloading (reconnected)" : "Downloading");
+                }
+                delay(1);
+            }
+            ok = gOtaInstalled;
+            if (!ok) {
+                err = gOtaLastErr[0] ? gOtaLastErr : "Could not start";
+                if (!strcmp(err, "Hash mismatch") || !strcmp(err, "Image rejected") || !strcmp(err, "Not a firmware image")) break;   // retrying will not help
+                otaSlimDraw(0, err);
+                delay(3000);
+            }
+        }
+    }
+    if (ok) {
+        otaSlimDraw(100, "Installed. Restarting...");
+        delay(1500);
+        if (after == OTA_AFTER_OFF) {                           // same final steps as powerOff()
+            while (powerReadButton()) delay(10);
+            digitalWrite(PIN_POWER, LOW);
+            delay(300);
+        }
+    } else {
+        tft.fillRect(0, 150, 240, 140, T.bg);
+        gfxText(120, 156, "Update failed", 2, T.bad, TD_TC);
+        gfxText(120, 190, err, 1, T.fg, TD_TC);
+        gfxText(120, 214, "Current version kept", 1, T.dim, TD_TC);
+        delay(5000);
+    }
+    ESP.restart();
+    while (true) delay(1000);
 }
 
 static void otaFailUi(const char* why) {
