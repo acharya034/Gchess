@@ -1,0 +1,15 @@
+{
+  "latest": {
+    "A": "1.0.0"
+  },
+  "versions": [
+    {
+      "v": "1.0.0",
+      "hw": "A",
+      "url": "https://raw.githubusercontent.com/acharya034/Gchess/v1.0/firmware/gchess_1.0.0.bin",
+      "sha256": "8d587afb059428cf0c49ad0645697433e6e242722dc3f9572fd7aef6a42d5a90",
+      "size": 1409504,
+      "notes": "github action test with ' ' space added."
+    }
+  ]
+}
