@@ -98,19 +98,31 @@ static void uiTask(void*) {
 void setup() {
   powerBegin();            // FIRST: hold the power latch so releasing the button does not switch us off
   dbgBegin();              // Serial monitor at 115200
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   esp_bt_controller_disable(); // disable Bluetooth to free up memory (we don't use it)
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   DBG(SYS, "==== %s v%s booting, reset reason %d, cpu %d MHz ====", GC_NAME, GC_VERSION, (int)esp_reset_reason(), (int)getCpuFrequencyMhz());
   dbgHeap("boot");
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   storageBegin();          // settings / accounts / Wi-Fi from flash
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   otaBegin();              // ota_skip / ota_pend / rollback state
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   analyticsBegin();
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   soundBegin();
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   lastBoardLoad();         // saved board map (setup.h)
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   ledsBegin();
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   boardBegin();
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   gfxBegin();              // display + touch (first boot: touch calibration screen)
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   gBeforeOff = goodbye;
+  DBG(SYS, "heap after display: free %u largest %u", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   // Queues and the mutex that protect data shared by the two cores
   qNet = xQueueCreate(16, sizeof(NetCmd));
@@ -118,6 +130,8 @@ void setup() {
   gNetMux = xSemaphoreCreateMutex();
   memset(gNetG, 0, sizeof(gNetG));
   memset(&gNetX, 0, sizeof(gNetX));
+
+  otaSlimBoot();           // runs a pending update, never returns when one is stored
 
   gamesInit();             // allocate the 3 game slots
   pagesBegin();            // register every page
