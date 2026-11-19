@@ -20,6 +20,7 @@ def clean_notes(text):
     return text.strip()[:60].rstrip()
 
 
+ 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
