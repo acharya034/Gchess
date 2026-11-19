@@ -1,12 +1,12 @@
 {
  "versions": [
   {
-   "v": "1.0.0",
+   "v": "1.0.1",
    "hw": "A",
-   "url": "https://raw.githubusercontent.com/acharya034/Gchess/v1.0/firmware/gchess_1.0.0.bin",
-   "sha256": "dbd17715af67ec4b63c3cdd46d527a774195243f0d4f2c4e5fbe2de84b83a1c8",
-   "size": 1394288,
-   "notes": "Add firmware build workflow and manifest script"
+   "url": "https://raw.githubusercontent.com/acharya034/Gchess/v1.0/firmware/gchess_1.0.1.bin",
+   "sha256": "03461a2d58bb46f61adda2680438643767af97315faa861702b717b5776662d7",
+   "size": 1399504,
+   "notes": "pull firmware"
   }
  ]
 }
