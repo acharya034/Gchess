@@ -10,12 +10,9 @@
 //    * Power off     : the ESP drives the pin LOW (or leaves it as INPUT) for longer than the
 //                      capacitor time (PWR_OFF_HOLD_MS) -> the latch releases.
 //
-//  BATTERY GAUGE (PIN_BAT, no resistor drawing current all the time):
-//    1) pin goes HIGH for 15 ms  -> charges a small capacitor
-//    2) pin becomes an input     -> the capacitor keeps a MOSFET on for about 1 second,
-//                                   which connects the divider to the battery
-//    3) we read the divider with the ADC, then the capacitor empties and the divider
-//       is disconnected again (current only flows for ~1 s every 20 s)
+//  BATTERY GAUGE (PIN_BAT): the divider is connected DIRECTLY to the battery (no MOSFET).
+//    The pin stays an input and is read with the ADC every BAT_READ_MS.
+//    (The divider always draws about 4.2 V / 147k = 29 uA.)
 //
 //  DIVIDER: 47k from battery (+) to the pin, 100k from the pin to GND.
 //     Vpin = Vbat * 100 / (47 + 100)  ->  BAT_DIV must be (147.0f / 100.0f) = 1.47f
@@ -51,6 +48,9 @@
 #ifndef BAT_SAMPLES
 #define BAT_SAMPLES 24          // ADC readings per measurement (min and max are thrown away)
 #endif
+#ifndef BAT_READ_MS
+#define BAT_READ_MS 1000        // read the battery once a second (no switching circuit any more)
+#endif
 #ifndef BAT_FILTER_NEW
 #define BAT_FILTER_NEW 0.35f    // weight of the new measurement (0.35 = fairly quick, still smooth)
 #endif
@@ -74,10 +74,7 @@ static uint32_t pwrDownAt = 0;     // when the press started
 static uint32_t pwrLastSample = 0; // when the pin was sampled last
 
 // --- battery / charger state ---
-enum BatState : uint8_t { BAT_IDLE, BAT_PULSE, BAT_SETTLE };
 enum ChargeState : uint8_t { CHG_NONE, CHG_CHARGING, CHG_FULL };
-static BatState batState = BAT_IDLE;
-static uint32_t batT0 = 0;         // start time of the current step
 static uint32_t batLast = 0;       // time of the last finished measurement
 static float vbat = 3.9f;          // battery voltage in volts (filtered)
 static ChargeState chgState = CHG_NONE;
@@ -164,39 +161,15 @@ inline uint32_t batteryReadPinMv() {
   return sum / (BAT_SAMPLES - 2);
 }
 
-// Small state machine so the hardware task never waits (one step per call).
+// Divider is connected directly to the battery (no MOSFET), so just read it every BAT_READ_MS.
 inline void batteryService(uint32_t now) {
-  switch (batState) {
-    case BAT_IDLE:
-      if (batLast == 0 || now - batLast >= BAT_PERIOD_MS) {
-        pinMode(PIN_BAT, OUTPUT);
-        digitalWrite(PIN_BAT, HIGH);          // step 1: charge the capacitor
-        batT0 = now;
-        batState = BAT_PULSE;
-      }
-      break;
-
-    case BAT_PULSE:
-      if (now - batT0 >= BAT_PULSE_MS) {
-        pinMode(PIN_BAT, INPUT);              // step 2: release the pin, capacitor keeps the MOSFET on
-        batT0 = now;
-        batState = BAT_SETTLE;
-      }
-      break;
-
-    case BAT_SETTLE:
-      if (now - batT0 >= BAT_SETTLE_MS) {
-        // step 3: read the divider (must finish inside the ~1 s the MOSFET stays on)
-        float pinMv = (float)batteryReadPinMv();
-        float v = pinMv * BAT_DIV * BAT_CAL / 1000.0f;   // BAT_DIV = 1.47 for 47k + 100k
-        // first value is taken as is; later values are smoothed
-        vbat = (batLast == 0) ? v : vbat * (1.0f - BAT_FILTER_NEW) + v * BAT_FILTER_NEW;
-        batLast = now;
-        batState = BAT_IDLE;
-        DBG(POWER, "battery: pin=%.0fmV raw=%.3fV filtered=%.3fV -> %d%%", pinMv, v, vbat, batteryPercent());
-      }
-      break;
-  }
+  if (batLast != 0 && now - batLast < BAT_READ_MS) return;
+  float pinMv = (float)batteryReadPinMv();
+  float v = pinMv * BAT_DIV * BAT_CAL / 1000.0f;   // BAT_DIV = 1.47 for 47k + 100k
+  // first value is taken as is; later values are smoothed
+  vbat = (batLast == 0) ? v : vbat * (1.0f - BAT_FILTER_NEW) + v * BAT_FILTER_NEW;
+  batLast = now ? now : 1;                          // never 0 (0 means "no reading yet")
+  DBG(POWER, "battery: pin=%.0fmV raw=%.3fV filtered=%.3fV -> %d%%", pinMv, v, vbat, batteryPercent());
 }
 
 // Read the charger pin often and decide: nothing / charging / full.
