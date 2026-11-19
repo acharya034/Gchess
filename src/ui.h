@@ -37,7 +37,8 @@ enum PageId : uint8_t {
     PG_BOARDTEST,
     PG_ABOUT,
     PG_ONGOING,
-    PG_SETUP,      
+    PG_SETUP,    
+    PG_OTA,  
     PG_COUNT
 };
 enum TouchPhase : uint8_t {
@@ -50,6 +51,9 @@ enum {
     PF_NOBACK = 2,
     PF_NOPUSH = 4
 };  // NOBACK = hide back arrow, NOPUSH = never return to this page with Back
+
+static bool otaPowerIntercept(bool restart);   // ota.h
+
 struct Page {
     const char* name;
     void (*enter)();
@@ -442,7 +446,7 @@ inline void uiDialog3(const char* title, const char* msg, const char* b1, const 
     dlg.toQuick = false;
     DBG(UI, "DIALOG open '%s'", dlg.title);
     gModal = MD_DIALOG;
-    dialogDraw();
+    dialogDraw(); 
 }
 
 // Dialog with one or two buttons.
@@ -855,10 +859,12 @@ inline void qmTouch(TouchPhase ph, int x, int y) {
     }
 }
 
+bool otaPowerIntercept();
+
 // Answer of the power box: 1 restart, 2 power off.
 static void powerDlgCb(int r) {
-    if (r == 1) powerRestart();
-    else if (r == 2) powerOff();
+    if (r == 1) { if (!otaPowerIntercept(true))  powerRestart(); }
+    else if (r == 2) { if (!otaPowerIntercept(false)) powerOff(); }
 }
 
 // ---------------- touch pump (called every ~15 ms) ----------------
@@ -1000,9 +1006,9 @@ inline void uiPumpEvents() {
         } else if (pe == PE_HOLD4) {
             uiToast("Release to power off", 4000);
         } else if (pe == PE_RESTART) {
-            powerRestart();
+            if (!otaPowerIntercept(true)) powerRestart();
         } else if (pe == PE_OFF) {
-            powerOff();
+            if (!otaPowerIntercept(false)) powerOff();
         }
     }
 }

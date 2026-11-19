@@ -40,6 +40,7 @@
 #include "net.h"
 #include "pages.h"
 #include "setup.h"
+#include "ota.h"
 #include <esp_bt.h> // disable Bluetooth to free up memory (we don't use it)
 
 // Drawn by powerOff() just before the board switches itself off.
@@ -79,6 +80,7 @@ static void uiTask(void*) {
           (int)gBootCheck, __builtin_popcountll(o), __builtin_popcountll(gLb.occ), __builtin_popcountll(o ^ gLb.occ));
     }
     lastBoardTick();
+    otaUiTick();
     if (setupActive()) setupTick(boardOccupancy());
     else physTick();
     if (!gScreenOff && gModal == MD_NONE && gPages[gCur].tick) gPages[gCur].tick();   // page animations / redraws
@@ -101,6 +103,7 @@ void setup() {
   dbgHeap("boot");
 
   storageBegin();          // settings / accounts / Wi-Fi from flash
+  otaBegin();              // ota_skip / ota_pend / rollback state
   analyticsBegin();
   soundBegin();
   lastBoardLoad();         // saved board map (setup.h)

@@ -2239,6 +2239,14 @@ static void aboutDraw() {
     gfxText(120, 250, "Made with love for real chess.", 1, T.accent, TD_TC);
 }
 
+// OTA page: check for updates, show progress and result.
+static bool otaUiEvent(const UiEvt& e);
+static void otaPageDraw();
+static void otaAboutEnter();
+static void otaAboutDraw();
+static void otaAboutTouch(TouchPhase, int, int);
+static void otaAboutEvent(const UiEvt&);
+
 // ---------- global events ----------
 // Answer of the challenge notification (1 decline, 2 accept).
 static void challengeCb(int r) {
@@ -2249,6 +2257,7 @@ static void challengeCb(int r) {
 // r: 1 decline, 2 accept
 static bool globalEvt(const UiEvt& e) {
     DBG(UI, "global event %s handled by the UI task", UE_NAMES[e.t]);
+    if (e.t == UE_OTA) return otaUiEvent(e);
     switch (e.t) {
         case UE_GAME_START: {
             int slot = e.a >> 1;
@@ -2366,5 +2375,6 @@ inline void pagesBegin() {
     gPages[PG_WIFI] = {"Wi-Fi", wifiEnter, wifiDraw, wifiTouch, nullptr, nullptr, listEvent, PF_TOOLBAR};
     gPages[PG_BOARDTEST] = {"Board test", nullptr, btDraw, btTouch, btTick, [](){ ledsClear();}, nullptr, PF_TOOLBAR};
     gPages[PG_ABOUT] = {"About", nullptr, aboutDraw, nullptr, nullptr, nullptr, nullptr, PF_TOOLBAR};
+    gPages[PG_OTA]   = {"Update", nullptr, otaPageDraw, nullptr, nullptr, nullptr, nullptr, 0};
     gPages[PG_SETUP] = {"Set up", spEnter, spDraw, spTouch, spTick, spLeave, spEvent, PF_TOOLBAR | PF_NOPUSH, spPartial};
 }

@@ -1401,6 +1401,8 @@ static void handleCmd(NetCmd& c) {
             linkSrv.stop();
             gLinkOn = false;
         } break;
+        case NC_OTA_CHECK:
+        case NC_OTA_START: otaNetCmd(c); break;
         default: break;
     }
 }
@@ -1414,6 +1416,7 @@ static void netTask(void*) {
         NetCmd c;
         while (xQueueReceive(qNet, &c, 0) == pdTRUE) handleCmd(c);
         wifiTick();
+        if (otaNetTick()) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }   // true while a download runs: all polling below is paused
         if (gLinkOn) linkSrv.handleClient();
         if (gNeedAccount && gLoggedIn && WiFi.status() == WL_CONNECTED) {
             static uint32_t t = 0;
@@ -1476,7 +1479,7 @@ static void netTask(void*) {
 
 // Start the network task on core 1.
 inline void netBegin() {
-    xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 1);
+    xTaskCreatePinnedToCore(netTask, "net", 24576, nullptr, 1, nullptr, 1);
 }
 
 // CORE 1

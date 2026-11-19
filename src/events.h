@@ -34,7 +34,9 @@ enum NetCmdType : uint8_t {
     NC_WIFI_CONNECT,
     NC_WIFI_ENABLE,
     NC_LINK_START,
-    NC_LINK_STOP
+    NC_LINK_STOP,
+    NC_OTA_CHECK,      // a = 1 manual (About page)
+    NC_OTA_START
 };
 struct NetCmd {
     NetCmdType t;
@@ -56,7 +58,8 @@ enum UiEvtType : uint8_t {
     UE_TOAST,
     UE_LINK_URL,
     UE_LINK_DONE,
-    UE_EXPORT
+    UE_EXPORT,
+    UE_OTA             // a = OtaState, b = percent | manifest index | manual flag, s1 = version, s2 = text
 };
 struct UiEvt {
     UiEvtType t;
@@ -65,13 +68,19 @@ struct UiEvt {
     int16_t a, b;
 };
 
+enum OtaState : uint8_t { OTA_NONE, OTA_UPTODATE, OTA_OFFER, OTA_INDEX, OTA_PROGRESS, OTA_DONE, OTA_ERROR, OTA_CHECK_FAIL };
+// implemented in ota.h (included last in Gchess.ino)
+static void otaNetCmd(const NetCmd& c);
+static bool otaNetTick();
+
 enum ListKind : uint8_t {
     LK_FRIENDS,
     LK_SEARCH,
     LK_HISTORY,
     LK_WIFI,
     LK_ONGOING,
-    LK_COUNT
+    LK_OTA, 
+    LK_COUNT 
 };
 struct ListItem {
     char main[30];
@@ -103,8 +112,8 @@ struct NetGame {
 };
 
 // Human readable names (same order as the enums above) - used only for the serial log.
-static const char* const NC_NAMES[] = {"NONE", "LOGIN", "LOGOUT", "AI", "CHALLENGE", "SEEK", "CANCEL_SEEK", "ACCEPT", "DECLINE", "MOVE", "RESIGN", "ABORT", "DRAW", "TAKEBACK", "PUZ_DAILY", "PUZ_BATCH", "SEARCH", "FRIENDS", "HISTORY", "GAME_EXPORT", "ONGOING", "OPEN_GAME", "PARK_GAME", "WIFI_SCAN", "WIFI_CONNECT", "WIFI_ENABLE", "LINK_START", "LINK_STOP"};
-static const char* const UE_NAMES[] = {"NONE", "NET", "LOGIN", "GAME_START", "GAME_UPDATE", "GAME_END", "CHALLENGE", "LIST", "PUZZLE", "TOAST", "LINK_URL", "LINK_DONE", "EXPORT"};
+static const char* const NC_NAMES[] = {"NONE", "LOGIN", "LOGOUT", "AI", "CHALLENGE", "SEEK", "CANCEL_SEEK", "ACCEPT", "DECLINE", "MOVE", "RESIGN", "ABORT", "DRAW", "TAKEBACK", "PUZ_DAILY", "PUZ_BATCH", "SEARCH", "FRIENDS", "HISTORY", "GAME_EXPORT", "ONGOING", "OPEN_GAME", "PARK_GAME", "WIFI_SCAN", "WIFI_CONNECT", "WIFI_ENABLE", "LINK_START", "LINK_STOP", "OTA_CHECK", "OTA_START"};
+static const char* const UE_NAMES[] = {"NONE", "NET", "LOGIN", "GAME_START", "GAME_UPDATE", "GAME_END", "CHALLENGE", "LIST", "PUZZLE", "TOAST", "LINK_URL", "LINK_DONE", "EXPORT", "OTA"};
 
 static QueueHandle_t qNet, qUi;
 static SemaphoreHandle_t gNetMux;
