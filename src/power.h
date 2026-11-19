@@ -13,12 +13,20 @@
 //  BATTERY GAUGE (PIN_BAT, no resistor drawing current all the time):
 //    1) pin goes HIGH for 15 ms  -> charges a small capacitor
 //    2) pin becomes an input     -> the capacitor keeps a MOSFET on for about 1 second,
-//                                   which connects the 100k/100k divider to the battery
+//                                   which connects the divider to the battery
 //    3) we read the divider with the ADC, then the capacitor empties and the divider
 //       is disconnected again (current only flows for ~1 s every 20 s)
 //
-//  CHARGER (PIN_CHG): the two LEDs of the charger module are connected through two
-//  different resistors to this pin. Different voltage = different LED lit.
+//  DIVIDER: 47k from battery (+) to the pin, 100k from the pin to GND.
+//     Vpin = Vbat * 100 / (47 + 100)  ->  BAT_DIV must be (147.0f / 100.0f) = 1.47f
+//     4.20 V battery -> 2.857 V at the pin (inside the 11 dB range of the ADC).
+//     NOTE: ~32k source impedance is high for the ESP32 ADC. Put 100 nF from the pin to GND
+//     (next to the pin) and keep the many-samples averaging below, otherwise the reading is
+//     noisy / low and the percent jumps in big steps.
+//
+//  CHARGER (PIN_CHG): HIGH = charging. The charger LED BLINKS (1 s on / 1 s off) while charging,
+//  so a LOW reading alone does NOT mean "not charging". We only say "not charging" when the pin
+//  stayed LOW for longer than CHG_LOSS_MS (longer than one full blink period).
 //
 //  Public API:
 //     powerBegin()         first line in setup()
@@ -37,6 +45,21 @@
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
 #include <WiFi.h>
+#include <math.h>
+
+// ---- tuning (can be overridden in gchess_config.h) ----
+#ifndef BAT_SAMPLES
+#define BAT_SAMPLES 24          // ADC readings per measurement (min and max are thrown away)
+#endif
+#ifndef BAT_FILTER_NEW
+#define BAT_FILTER_NEW 0.35f    // weight of the new measurement (0.35 = fairly quick, still smooth)
+#endif
+#ifndef CHG_SAMPLE_MS
+#define CHG_SAMPLE_MS 100       // read the charger pin 10 times a second (catches the blink)
+#endif
+#ifndef CHG_LOSS_MS
+#define CHG_LOSS_MS 2500        // LOW for longer than this (blink is 1 s off) => not charging
+#endif
 
 // Events produced by the button; the UI task reads and clears gPwrEvt.
 enum PwrEvt : uint8_t { PE_NONE, PE_SHORT, PE_RESTART, PE_OFF, PE_HOLD2, PE_HOLD4 };
@@ -60,6 +83,9 @@ static float vbat = 3.9f;          // battery voltage in volts (filtered)
 static ChargeState chgState = CHG_NONE;
 static int chgMv = 0;              // raw millivolts on the charger pin (for calibration)
 static uint32_t chgLast = 0;
+static int chgLastHighMv = 0;      // last reading that was "lit"
+static uint32_t chgLastHighAt = 0; // when that happened
+static bool chgSeen = false;       // true once a "lit" reading was seen
 
 // Optional hook: UI draws a goodbye screen before the board switches off.
 static void (*gBeforeOff)() = nullptr;
@@ -83,10 +109,7 @@ inline bool powerReadButton() {
   pinMode(PIN_POWER, INPUT_PULLDOWN);     // let the pin float up (button open = HIGH)
   delayMicroseconds(PWR_READ_US);        // wait until the wire has reached its level
   bool pressed = (digitalRead(PIN_POWER) == HIGH);
-  powerPinIdle();    
-  // bool down = powerReadButton();
-  // if (pressed) DBG(POWER, "Button state: PRESSED"); else DBG(POWER, "Button state: RELEASED");
-  // DBG(POWER, "Button state: %s", pressed ? "PRESSED" : "RELEASED");                    // back to LOW right away
+  powerPinIdle();                          // back to HIGH right away
   return pressed;
 }
 
@@ -96,20 +119,27 @@ inline bool powerButtonHeld() {
 
 // ---------- battery gauge --------------------------------------------------------------
 
-// Piecewise linear lithium cell curve: voltage -> percent
+// Piecewise linear lithium cell curve: voltage -> percent. Many points = smooth 1 % steps.
+// (voltages must be ascending)
 inline int batteryPercent() {
-  static const float v[] = {3.30, 3.50, 3.65, 3.75, 3.85, 3.95, 4.05, 4.20};
-  static const int p[] = {0, 5, 20, 40, 60, 75, 90, 100};
+  static const float v[] = {3.27f, 3.61f, 3.69f, 3.71f, 3.73f, 3.75f, 3.77f, 3.79f, 3.80f, 3.82f, 3.84f,
+                            3.85f, 3.87f, 3.91f, 3.95f, 3.98f, 4.02f, 4.08f, 4.11f, 4.15f, 4.20f};
+  static const float p[] = {0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50,
+                            55, 60, 65, 70, 75, 80, 85, 90, 95, 100};
+  const int N = sizeof(v) / sizeof(v[0]);
   if (vbat <= v[0]) return 0;
-  if (vbat >= v[7]) return 100;
-  for (int i = 1; i < 8; i++) {
-    if (vbat <= v[i]) return p[i - 1] + (int)((vbat - v[i - 1]) / (v[i] - v[i - 1]) * (p[i] - p[i - 1]));
+  if (vbat >= v[N - 1]) return 100;
+  for (int i = 1; i < N; i++) {
+    if (vbat <= v[i]) {
+      float pc = p[i - 1] + (vbat - v[i - 1]) / (v[i] - v[i - 1]) * (p[i] - p[i - 1]);
+      return (int)roundf(pc);              // 41, 42, 43 ... not only 40, 50, 60
+    }
   }
   return 100;
 }
 
 inline int batteryMv() {
-  return (int)(vbat * 1000);
+  return (int)(vbat * 1000.0f);
 }
 
 inline bool isCharging() {
@@ -118,6 +148,20 @@ inline bool isCharging() {
 
 inline bool isFull() {
   return chgState == CHG_FULL;
+}
+
+// Average of many ADC readings; the lowest and highest are discarded (removes spikes).
+inline uint32_t batteryReadPinMv() {
+  uint32_t sum = 0, mn = 0xFFFFFFFF, mx = 0;
+  for (int n = 0; n < BAT_SAMPLES; n++) {
+    uint32_t r = analogReadMilliVolts(PIN_BAT);
+    sum += r;
+    if (r < mn) mn = r;
+    if (r > mx) mx = r;
+    delayMicroseconds(50);
+  }
+  sum -= mn + mx;
+  return sum / (BAT_SAMPLES - 2);
 }
 
 // Small state machine so the hardware task never waits (one step per call).
@@ -142,30 +186,46 @@ inline void batteryService(uint32_t now) {
 
     case BAT_SETTLE:
       if (now - batT0 >= BAT_SETTLE_MS) {
-        uint32_t sum = 0;                     // step 3: read the divider (average of 8)
-        // for (int n = 0; n < 8; n++) sum += analogReadMilliVolts(PIN_BAT);
-        sum = 7;
-        float v = (sum / 8.0f) * BAT_DIV * BAT_CAL / 1000.0f;
-        vbat = (batLast == 0) ? v : vbat * 0.7f + v * 0.3f;   // smooth the value
+        // step 3: read the divider (must finish inside the ~1 s the MOSFET stays on)
+        float pinMv = (float)batteryReadPinMv();
+        float v = pinMv * BAT_DIV * BAT_CAL / 1000.0f;   // BAT_DIV = 1.47 for 47k + 100k
+        // first value is taken as is; later values are smoothed
+        vbat = (batLast == 0) ? v : vbat * (1.0f - BAT_FILTER_NEW) + v * BAT_FILTER_NEW;
         batLast = now;
         batState = BAT_IDLE;
-        DBG(POWER, "battery: raw=%.3fV filtered=%.3fV -> %d%%", v, vbat, batteryPercent());
+        DBG(POWER, "battery: pin=%.0fmV raw=%.3fV filtered=%.3fV -> %d%%", pinMv, v, vbat, batteryPercent());
       }
       break;
   }
 }
 
-// Read the charger pin once a second and decide: nothing / charging / full.
+// Read the charger pin often and decide: nothing / charging / full.
+// The charger LED blinks (1 s on, 1 s off) while charging, so:
+//   * a "lit" reading  => charging right now
+//   * LOW              => do NOT say "not charging" yet; keep the last state until the pin has
+//                         stayed LOW for CHG_LOSS_MS (longer than a whole blink period)
 inline void chargerService(uint32_t now) {
-  if (now - chgLast < 1000) return;
+  if (now - chgLast < CHG_SAMPLE_MS) return;
   chgLast = now;
-  // chgMv = analogReadMilliVolts(PIN_CHG);
-  chgMv = 0; // --- IGNORE ---
+  chgMv = analogReadMilliVolts(PIN_CHG);
+
+  if (chgMv >= CHG_MV_FULL_MIN) {             // pin is HIGH (some LED lit)
+    chgLastHighMv = chgMv;
+    chgLastHighAt = now;
+    chgSeen = true;
+  }
+
   ChargeState s = CHG_NONE;
-  if (chgMv >= CHG_MV_CHARGING_MIN) s = CHG_CHARGING;
-  else if (chgMv >= CHG_MV_FULL_MIN) s = CHG_FULL;
-  if (s != chgState) DBG(POWER, "charger: %dmV -> %s", chgMv, s == CHG_CHARGING ? "CHARGING" : s == CHG_FULL ? "FULL" : "no USB");
-  else DBG(POWER, "charger pin: %dmV", chgMv);
+  if (chgSeen && (now - chgLastHighAt) < CHG_LOSS_MS) {
+    // use the last lit voltage, so the dark half of the blink does not change the answer
+    s = (chgLastHighMv >= CHG_MV_CHARGING_MIN) ? CHG_CHARGING : CHG_FULL;
+  } else {
+    chgSeen = false;                          // LOW long enough: really not charging
+  }
+
+  if (s != chgState) {
+    DBG(POWER, "charger: %dmV -> %s", chgMv, s == CHG_CHARGING ? "CHARGING" : s == CHG_FULL ? "FULL" : "no USB");
+  }
   chgState = s;
 }
 
@@ -174,8 +234,8 @@ inline void chargerService(uint32_t now) {
 inline void powerBegin() {
   powerPinIdle();                             // hold the latch
   analogReadResolution(12);
-  // analogSetPinAttenuation(PIN_BAT, ADC_11db); // measure up to ~3.1 V at the pin
-  // analogSetPinAttenuation(PIN_CHG, ADC_11db);
+  analogSetPinAttenuation(PIN_BAT, ADC_11db); // measure up to ~3.1 V at the pin
+  analogSetPinAttenuation(PIN_CHG, ADC_11db);
   pinMode(PIN_CHG, INPUT);
   pinMode(PIN_BAT, INPUT);
 }
@@ -191,7 +251,7 @@ inline void powerBegin() {
   lastBoardFlush();                           // saved board survives the power cut
   storageSaveAll();                           // data is safe now
   WiFi.disconnect(true, false);
-  
+
   uint32_t t = millis();
   while (millis() - t < 900) {                // let the goodbye melody play
     soundTick();
