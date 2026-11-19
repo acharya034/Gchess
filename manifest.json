@@ -1,8 +1,16 @@
 {
   "latest": {
-    "A": "1.0.3"
+    "A": "1.0.4"
   },
   "versions": [
+    {
+      "v": "1.0.4",
+      "hw": "A",
+      "url": "https://raw.githubusercontent.com/acharya034/Gchess/v1.0/firmware/gchess_1.0.4.bin",
+      "sha256": "f02993148021c292cbb8f2ef7b23e330fdbd91506c407d14ba2c75a94a498f59",
+      "size": 1416672,
+      "notes": "Merge branch 'v1.0' of https://github.com/acharya034/Gchess"
+    },
     {
       "v": "1.0.3",
       "hw": "A",

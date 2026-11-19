@@ -1,12 +1,12 @@
 {
  "versions": [
   {
-   "v": "1.0.3",
+   "v": "1.0.4",
    "hw": "A",
-   "url": "https://raw.githubusercontent.com/acharya034/Gchess/v1.0/firmware/gchess_1.0.3.bin",
-   "sha256": "65fa140a1f88cff453c9fb988e7b5c793886487eefbb03150a92ccd9f5f9c5b7",
-   "size": 1416768,
-   "notes": "battery checking and percentage system micro problem solving"
+   "url": "https://raw.githubusercontent.com/acharya034/Gchess/v1.0/firmware/gchess_1.0.4.bin",
+   "sha256": "f02993148021c292cbb8f2ef7b23e330fdbd91506c407d14ba2c75a94a498f59",
+   "size": 1416672,
+   "notes": "Merge branch 'v1.0' of https://github.com/acharya034/Gchess"
   }
  ]
 }
