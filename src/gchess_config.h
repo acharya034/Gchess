@@ -50,9 +50,10 @@
 #define PIN_BUZZER   3   // passive buzzer
 
 // Power: ONE pin does everything (see wiring diagram "Power").
-//   idle  = driven LOW  (keeps the latch happy)
-//   read  = every 5 ms it is briefly switched to INPUT_PULLUP to see if the button is pressed
-//   off   = driven HIGH for a moment -> the latch releases and the board powers down
+//   HIGH            = ON   (the ESP holds the latch; the capacitor is kept charged)
+//   LOW for a moment = the pin is released (INPUT) for ~25 us to read the button; the capacitor
+//                      keeps the latch closed for about 1 second, so this is invisible
+//   LOW / INPUT held longer than the capacitor time (PWR_OFF_HOLD_MS) = OFF -> the latch releases
 #define PIN_POWER     2
 
 // Battery and charger readings (both must be ADC1 pins: 32..39)
@@ -86,6 +87,7 @@ const int hallpin[3][4] = {
 #define PWR_READ_US      25    // pull-up window length
 #define BTN_RESTART_MS 2000    // hold this long  -> restart
 #define BTN_OFF_MS     4000    // hold this long  -> power off
+#define PWR_OFF_HOLD_MS 2000   // keep the pin LOW at least this long on power off (must be longer than the ~1 s the capacitor holds the latch)
 
 // ---------- Battery gauge -------------------------------------------------------------
 #define BAT_PERIOD_MS 20000    // measure every 20 s

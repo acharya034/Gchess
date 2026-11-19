@@ -95,15 +95,15 @@ inline void analyticsEvent(const char* name, int32_t value = 0) {
 
 // Save all counters to flash (done every 5 minutes and before power off).
 inline void analyticsFlush() {
-    DBG(SYS, "analytics saved to flash");
-    uint32_t now = millis();
-    if (anCur >= 0) {
-        gAn.pg[anCur].ms += now - anSince;
-        anSince = now;
-    }
-    gAn.uptimeS += (now - anLastFlush) / 1000;
-    anLastFlush = now;
-    gPrefs.putBytes("an", &gAn, sizeof(gAn));
+    // DBG(SYS, "analytics saved to flash");
+    // uint32_t now = millis();
+    // if (anCur >= 0) {
+    //     gAn.pg[anCur].ms += now - anSince;
+    //     anSince = now;
+    // }
+    // gAn.uptimeS += (now - anLastFlush) / 1000;
+    // anLastFlush = now;
+    // gPrefs.putBytes("an", &gAn, sizeof(gAn));
 }
 
 // Forget all counters (call after a successful upload).

@@ -1,12 +1,14 @@
 // =====================================================================================
 //  power.h  -  power latch (ONE pin), push button, battery gauge, charger state
 //
-//  ONE PIN (PIN_POWER) is connected to: the push button (to GND) and the latch circuit.
-//    * Board is off  : press the button -> the pin is pulled LOW -> the latch switches on
-//                      and STAYS on after you release the button (no ESP needed).
-//    * Board is on   : the ESP keeps the pin LOW (idle). Every 5 ms it lets the pin go for
-//                      25 microseconds (INPUT_PULLUP) to see if the button is pressed.
-//    * Power off     : the ESP drives the pin HIGH for a moment -> latch releases.
+//  ONE PIN (PIN_POWER) is connected to: the push button and the latch circuit (with a capacitor).
+//    * Board is off  : press the button -> the latch switches on and STAYS on after you
+//                      release the button (no ESP needed).
+//    * Board is on   : the ESP drives the pin HIGH (HIGH = ON). Every PWR_SAMPLE_MS it lets the
+//                      pin go (INPUT) for PWR_READ_US microseconds to see if the button is pressed.
+//                      The capacitor keeps the latch closed for about 1 s, so the board stays on.
+//    * Power off     : the ESP drives the pin LOW (or leaves it as INPUT) for longer than the
+//                      capacitor time (PWR_OFF_HOLD_MS) -> the latch releases.
 //
 //  BATTERY GAUGE (PIN_BAT, no resistor drawing current all the time):
 //    1) pin goes HIGH for 15 ms  -> charges a small capacitor
@@ -33,6 +35,7 @@
 #include "setup.h"
 #include "analytics.h"
 #include <esp_sleep.h>
+#include <driver/rtc_io.h>
 #include <WiFi.h>
 
 // Events produced by the button; the UI task reads and clears gPwrEvt.
@@ -61,9 +64,14 @@ static uint32_t chgLast = 0;
 // Optional hook: UI draws a goodbye screen before the board switches off.
 static void (*gBeforeOff)() = nullptr;
 
+// Set by powerOff(). From then on NOTHING else may touch PIN_POWER: the hardware task samples the
+// button every PWR_SAMPLE_MS and each sample ends with powerPinIdle(), which would overwrite the
+// "off" level and keep the latch closed.
+static volatile bool gPowerOffing = false;
+
 // ---------- button ---------------------------------------------------------------------
 
-// Put the pin back to "idle LOW output" (this is what holds the latch happy).
+// Put the pin back to "idle HIGH output" (HIGH = ON: this is what holds the latch closed).
 inline void powerPinIdle() {
   digitalWrite(PIN_POWER, HIGH);
   pinMode(PIN_POWER, OUTPUT);
@@ -71,7 +79,8 @@ inline void powerPinIdle() {
 
 // Look at the button for a very short moment. Returns true while it is pressed.
 inline bool powerReadButton() {
-  pinMode(PIN_POWER, INPUT_PULLDOWN);      // let the pin float up (button open = HIGH)
+  if (gPowerOffing) return false;          // power-off in progress: leave the pin alone
+  pinMode(PIN_POWER, INPUT_PULLDOWN);     // let the pin float up (button open = HIGH)
   delayMicroseconds(PWR_READ_US);        // wait until the wire has reached its level
   bool pressed = (digitalRead(PIN_POWER) == HIGH);
   powerPinIdle();    
@@ -188,19 +197,27 @@ inline void powerBegin() {
     soundTick();
     delay(5);
   }
-  while (powerReadButton()) delay(10);        // wait until the button is released (a pressed button holds the latch on)
+  // Wait until the button is released (a pressed button holds the latch on). Give up after 3 s so a
+  // stuck reading can never block the shutdown forever.
+  t = millis();
+  while (powerReadButton() && millis() - t < 3000) delay(10);
 
-  digitalWrite(PIN_POWER, LOW);              // the "off" signal
-  delay(300); 
-  
-  while (true) {
-    delay(1000);
-  }// on battery power we die here
+  // From here on the hardware task must not touch the pin any more (see gPowerOffing).
+  gPowerOffing = true;
+  delay(PWR_SAMPLE_MS + 10);                  // let a sample that was already running finish
 
-  // Still alive => powered by USB. Sleep until the button is pressed again.
-  // pinMode(PIN_POWER, INPUT_PULLDOWN);
-  // esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_POWER, 0);
-  // esp_deep_sleep_start();
+  pinMode(PIN_POWER, OUTPUT);
+  digitalWrite(PIN_POWER, LOW);               // the "off" signal
+  delay(PWR_OFF_HOLD_MS);                     // longer than the ~1 s the capacitor holds the latch: on battery we die here
+
+  // Still alive => powered by USB (the latch cannot cut USB power). Sleep until the button is pressed.
+  // NOTE: wake level 1 matches powerReadButton() (pressed = HIGH). If your latch circuit pulls the pin
+  // LOW when the button is pressed, change the level below to 0 and the pull to pull-up.
+  rtc_gpio_pullup_dis((gpio_num_t)PIN_POWER);
+  rtc_gpio_pulldown_en((gpio_num_t)PIN_POWER);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_POWER, 1);
+  esp_deep_sleep_start();
+  while (true) delay(1000);                   // never reached (keeps [[noreturn]] honest)
 }
 
 [[noreturn]] inline void powerRestart() {
@@ -217,6 +234,7 @@ inline void powerBegin() {
 // ---------- main loop part (called every ~1 ms) ----------------------------------------
 
 inline void powerTick() {
+  if (gPowerOffing) return;                   // shutting down: do not touch the pin
   uint32_t now = millis();
   batteryService(now);
   chargerService(now);
