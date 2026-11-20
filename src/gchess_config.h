@@ -57,8 +57,8 @@
 #define PIN_POWER     2
 
 // Battery and charger readings (both must be ADC1 pins: 32..39)
-#define PIN_BAT     33  // battery gauge: pulse it HIGH to charge the capacitor, then read it as ADC
-#define PIN_CHG     32 // charger LEDs through two different resistors -> voltage tells the state
+#define PIN_BAT     32  // battery gauge: pulse it HIGH to charge the capacitor, then read it as ADC
+#define PIN_CHG     33 // charger LEDs through two different resistors -> voltage tells the state
 
 
 const int hallpin[3][4] = {
