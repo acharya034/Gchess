@@ -10,8 +10,8 @@
 #define GC_TAGLINE   "Real pieces. Real games. Online."
 #define GC_VERSION "1.0.0"
 #define GC_HW      "A"
-#define MANIFEST_URL "https://raw.githubusercontent.com/acharya034/Gchess/main/manifest.json"
-#define LATEST_URL   "https://raw.githubusercontent.com/acharya034/Gchess/main/latest.json"
+#define MANIFEST_URL "https://raw.githubusercontent.com/acharya034/Gchess-firmware/main/manifest.json"
+#define LATEST_URL   "https://raw.githubusercontent.com/acharya034/Gchess-firmware/main/latest.json"
 
 // ---------- Account linking website -------------------------------------------------
 // The QR code on the board shows:  LINK_SITE_URL + "?d=<board ip>"

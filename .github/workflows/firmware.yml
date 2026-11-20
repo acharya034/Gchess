@@ -3,11 +3,11 @@ name: Build firmware
 on:
   push:
     branches: ['v[0-9]*.[0-9]*']        # v1.0, v1.1, v2.0 ... (not main, not version1)
-    paths-ignore: ['firmware/**', '**.md']
-  workflow_dispatch:                    # manual "Run workflow" button (use it for a brand new branch if nothing started)
+    paths-ignore: ['**.md']
+  workflow_dispatch:                    # manual "Run workflow" button (for a brand new branch if nothing started)
 
 permissions:
-  contents: write
+  contents: read                        # this repo is only read; the firmware repo is written with FIRMWARE_TOKEN
 
 concurrency:
   group: gchess-release
@@ -19,11 +19,20 @@ jobs:
     timeout-minutes: 30
     env:
       BRANCH: ${{ github.ref_name }}
-      MANIFEST_BRANCH: main
+      FW_REPO: acharya034/Gchess-firmware
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+
+      - name: Checkout firmware repo
+        uses: actions/checkout@v4
+        with:
+          repository: acharya034/Gchess-firmware
+          ref: main
+          token: ${{ secrets.FIRMWARE_TOKEN }}
+          path: fw
 
       - name: Pick the next version automatically
         shell: bash
@@ -35,13 +44,7 @@ jobs:
           [[ "$BRANCH" =~ ^v[0-9]+\.[0-9]+$ ]] || { echo "::error::Branch '$BRANCH' is not vX.Y"; exit 1; }
           XY="${BRANCH#v}"
 
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin "$MANIFEST_BRANCH"
-          git worktree add -B "$MANIFEST_BRANCH" "$RUNNER_TEMP/mf" "origin/$MANIFEST_BRANCH"
-
-          # newest patch already published for this X.Y, plus one (a brand new branch starts at X.Y.0)
-          VER=$(python3 - "$RUNNER_TEMP/mf/manifest.json" "$XY" <<'PY'
+          VER=$(python3 - "fw/manifest.json" "$XY" <<'PY'
           import json, sys
           try:
               m = json.load(open(sys.argv[1]))
@@ -53,7 +56,7 @@ jobs:
           )
           echo "Next version: $VER (hw $HW)"
 
-          # Put it into the source INSIDE the runner only (this change is never committed)
+          # write it into the source inside the runner only (never committed)
           sed -i -E 's|(#define[[:space:]]+GC_VERSION[[:space:]]+)"[^"]*"|\1"'"$VER"'"|' "$cfg"
           grep -q "GC_VERSION[[:space:]]*\"$VER\"" "$cfg" || { echo "::error::could not write version into $cfg"; exit 1; }
 
@@ -80,47 +83,33 @@ jobs:
           set -euo pipefail
           SRC=.pio/build/esp32dev/firmware.bin
           test -s "$SRC" || { echo "::error::$SRC missing"; exit 1; }
-          DEST="firmware/gchess_${VER}.bin"
-          SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
-          SIZE=$(stat -c %s "$SRC")
-          if [ -f "$DEST" ] && [ "$(sha256sum "$DEST" | cut -d' ' -f1)" != "$SHA" ]; then
-            echo "::error::$DEST already exists with a different sha256. Bump GC_VERSION."
-            exit 1
-          fi
-          mkdir -p firmware
-          cp "$SRC" "$DEST"
-          echo "SHA=$SHA"   >> "$GITHUB_ENV"
-          echo "SIZE=$SIZE" >> "$GITHUB_ENV"
-          echo "URL=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${BRANCH}/${DEST}" >> "$GITHUB_ENV"
+          cp "$SRC" "$RUNNER_TEMP/gchess_${VER}.bin"
+          REL="firmware/${BRANCH}/gchess_${VER}.bin"
+          echo "REL=$REL" >> "$GITHUB_ENV"
+          echo "BIN=$RUNNER_TEMP/gchess_${VER}.bin" >> "$GITHUB_ENV"
+          echo "SHA=$(sha256sum "$SRC" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "SIZE=$(stat -c %s "$SRC")" >> "$GITHUB_ENV"
+          echo "URL=https://raw.githubusercontent.com/${FW_REPO}/main/${REL}" >> "$GITHUB_ENV"
 
-      - name: Commit binary to this branch
+      - name: Publish firmware + manifest.json + latest.json
         shell: bash
         run: |
           set -euo pipefail
-          git add -f "firmware/gchess_${VER}.bin"
-          if git diff --cached --quiet; then
-            echo "Binary already committed."
-          else
-            git commit -m "firmware: gchess_${VER}.bin sha256=${SHA:0:12} [skip ci]"
-            git push origin "HEAD:refs/heads/${BRANCH}"
-          fi
-
-      - name: Publish manifest.json + latest.json
-        shell: bash
-        run: |
-          set -euo pipefail
-          M="$RUNNER_TEMP/mf"
+          git -C fw config user.name  "github-actions[bot]"
+          git -C fw config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           for i in 1 2 3 4 5; do
-            python3 scripts/update_manifest.py --manifest "$M/manifest.json" \
+            mkdir -p "fw/$(dirname "$REL")"
+            cp "$BIN" "fw/$REL"
+            python3 scripts/update_manifest.py --manifest fw/manifest.json \
               --version "$VER" --hw "$HW" --url "$URL" --sha256 "$SHA" --size "$SIZE" --commit "$GITHUB_SHA"
-            git -C "$M" add manifest.json latest.json
-            if git -C "$M" diff --cached --quiet; then echo "Already up to date."; break; fi
-            git -C "$M" commit -m "manifest: gchess ${VER} (hw ${HW}) [skip ci]"
-            if git -C "$M" push origin "HEAD:${MANIFEST_BRANCH}"; then break; fi
+            git -C fw add -A
+            if git -C fw diff --cached --quiet; then echo "Already up to date."; break; fi
+            git -C fw commit -m "gchess ${VER} (hw ${HW}) from ${BRANCH}"
+            if git -C fw push origin HEAD:main; then break; fi
             echo "Push rejected, retry $i/5"
-            git -C "$M" fetch origin "$MANIFEST_BRANCH"
-            git -C "$M" reset --hard "origin/$MANIFEST_BRANCH"
-            [ "$i" -lt 5 ] || { echo "::error::Could not update manifest"; exit 1; }
+            git -C fw fetch origin main
+            git -C fw reset --hard origin/main
+            [ "$i" -lt 5 ] || { echo "::error::Could not publish to $FW_REPO"; exit 1; }
           done
 
       - name: Summary

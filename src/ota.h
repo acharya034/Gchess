@@ -782,6 +782,16 @@ static void otaBarDraw() {
     gfxText(120, 228, gOtaTxt, 1, T.dim, TD_TC);
 }
 
+static void otaPageDraw() {
+    tft.fillScreen(T.bg);
+    gfxText(120, 70, "Updating Gchess", 2, T.fg, TD_TC);
+    char s[24];
+    snprintf(s, sizeof(s), "v%s", gOtaTitleVer);
+    gfxText(120, 110, s, 2, T.accent, TD_TC);
+    gfxText(120, 268, "Keep the board powered on", 1, T.dim, TD_TC);
+    otaBarDraw();
+}
+
 #if OTA_SLIM_BOOT
 // Start an update (UI side): remember the job in flash and restart. The download itself runs in otaSlimBoot()
 // right after the restart, when almost all RAM is free (the running firmware has only ~9 KB left with a TLS socket open).
@@ -795,7 +805,8 @@ static void otaStart(int idx, const char* ver, uint8_t after) {
     gPrefs.putBool("ota_job", true);
     otaSetPend(false);
     DBG(SYS, "ota: job saved for v%s, restarting into the slim update boot", ver);
-    uiToast("Restarting to update...");
+    tft.fillScreen(T.bg);                                     // clean screen before the restart, nothing of the old page is left behind
+    gfxText(120, 150, "Restarting to update...", 1, T.fg, TD_TC);
     delay(300);
     powerRestart();
 }
@@ -822,7 +833,7 @@ static void otaStart(int idx, const char* ver, uint8_t after) {
 //  Returns false when no update job is stored (normal start). Otherwise it never returns.
 // ---------------------------------------------------------------------------------------------
 static void otaSlimDraw(int pct, const char* txt) {
-    tft.fillRect(0, 150, 240, 140, T.bg);
+    tft.fillRect(0, 130, 240, 190, T.bg);
     gfxText(120, 156, txt, 1, T.fg, TD_TC);
     tft.drawRect(20, 190, 200, 16, T.card2);
     int w = (196 * constrain(pct, 0, 100)) / 100;
@@ -861,13 +872,11 @@ static bool otaSlimBoot() {
     uint8_t after = gPrefs.getUChar("ota_after", OTA_AFTER_RESTART);
     DBG(SYS, "ota: SLIM BOOT for v%s, free heap %u, largest %u", e.ver, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
-    tft.fillScreen(T.bg);
-    gfxText(120, 70, "Updating Gchess", 2, T.fg, TD_TC);
-    char s[24];
-    snprintf(s, sizeof(s), "v%s", e.ver);
-    gfxText(120, 110, s, 2, T.accent, TD_TC);
-    gfxText(120, 268, "Keep the board powered on", 1, T.dim, TD_TC);
-    otaBarDraw();
+    tft.fillScreen(T.bg);                                     // wipe whatever the previous firmware / the display RAM still shows
+    gfxText(120, 60, "Updating firmware", 2, T.accent, TD_TC);
+    char vs[24];
+    snprintf(vs, sizeof(vs), "to v%s", e.ver);
+    gfxText(120, 92, vs, 2, T.fg, TD_TC);
 
     bool ok = false;
     const char* err = "";
@@ -910,7 +919,7 @@ static bool otaSlimBoot() {
             delay(300);
         }
     } else {
-        tft.fillRect(0, 150, 240, 140, T.bg);
+        tft.fillRect(0, 130, 240, 190, T.bg);
         gfxText(120, 156, "Update failed", 2, T.bad, TD_TC);
         gfxText(120, 190, err, 1, T.fg, TD_TC);
         gfxText(120, 214, "Current version kept", 1, T.dim, TD_TC);
