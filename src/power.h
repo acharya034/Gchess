@@ -21,11 +21,20 @@
 //     (next to the pin) and keep the many-samples averaging below, otherwise the reading is
 //     noisy / low and the percent jumps in big steps.
 //
-//  CHARGER (PIN_CHG): HIGH = charging. The charger LED BLINKS (1 s on / 1 s off) while charging,
-//  so a LOW reading alone does NOT mean "not charging". We only say "not charging" when the pin
-//  stayed LOW for longer than CHG_LOSS_MS (longer than one full blink period).
+//  CHARGER (NO PIN NEEDED any more): charging is found from the battery voltage and the power pin.
+//    1) AT BOOT (powerBegin): PIN_POWER is read BEFORE we drive it.
+//         HIGH = the user pressed the button            -> not charging
+//         LOW  = the ESP got power from USB, no button  -> charging
+//       Special cases: deep-sleep wake = USB is present (powerOff only sleeps on USB) -> charging.
+//                      software restart / crash = pin test is not trustworthy (the capacitor
+//                      holds the latch while the pin floats), so the state saved in RTC memory is used.
+//    2) WHILE RUNNING (chargerDetect): a charger that is plugged in makes the battery voltage
+//       jump up by a few 100 mV (3.96 -> 4.10). A slow baseline follows the voltage. If the raw voltage
+//       stays CHG_JUMP_V above the baseline for CHG_CONFIRM readings -> charging.
+//       If it stays CHG_DROP_V below the baseline for CHG_CONFIRM readings -> not charging.
+//    3) FULL: charging and voltage >= CHG_FULL_V for CHG_FULL_HOLD_MS.
 //
-//  Public API:
+//  Public API (unchanged):
 //     powerBegin()         first line in setup()
 //     powerTick()          call every ~1 ms from the hardware task
 //     powerOff()           save everything and switch the board off
@@ -40,6 +49,7 @@
 #include "setup.h"
 #include "analytics.h"
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <driver/rtc_io.h>
 #include <WiFi.h>
 #include <math.h>
@@ -54,11 +64,26 @@
 #ifndef BAT_FILTER_NEW
 #define BAT_FILTER_NEW 0.35f    // weight of the new measurement (0.35 = fairly quick, still smooth)
 #endif
-#ifndef CHG_SAMPLE_MS
-#define CHG_SAMPLE_MS 100       // read the charger pin 10 times a second (catches the blink)
+#ifndef CHG_JUMP_V
+#define CHG_JUMP_V 0.10f        // voltage rise above the baseline that means "charger plugged in" (V)
 #endif
-#ifndef CHG_LOSS_MS
-#define CHG_LOSS_MS 2500        // LOW for longer than this (blink is 1 s off) => not charging
+#ifndef CHG_DROP_V
+#define CHG_DROP_V 0.10f        // voltage fall below the baseline that means "charger removed" (V)
+#endif
+#ifndef CHG_CONFIRM
+#define CHG_CONFIRM 3           // so many readings in a row (= seconds) must agree
+#endif
+#ifndef CHG_BASE_NEW
+#define CHG_BASE_NEW 0.05f      // baseline speed (0.05 = about 20 s time constant)
+#endif
+#ifndef CHG_FULL_V
+#define CHG_FULL_V 4.17f        // at or above this (while charging) the cell is nearly full
+#endif
+#ifndef CHG_FULL_HOLD_MS
+#define CHG_FULL_HOLD_MS 30000  // ... for this long => "full"
+#endif
+#ifndef CHG_FULL_HYST
+#define CHG_FULL_HYST 0.07f     // "full" ends when the voltage is this far below CHG_FULL_V
 #endif
 
 // Events produced by the button; the UI task reads and clears gPwrEvt.
@@ -78,11 +103,19 @@ enum ChargeState : uint8_t { CHG_NONE, CHG_CHARGING, CHG_FULL };
 static uint32_t batLast = 0;       // time of the last finished measurement
 static float vbat = 3.9f;          // battery voltage in volts (filtered)
 static ChargeState chgState = CHG_NONE;
-static int chgMv = 0;              // raw millivolts on the charger pin (for calibration)
-static uint32_t chgLast = 0;
-static int chgLastHighMv = 0;      // last reading that was "lit"
-static uint32_t chgLastHighAt = 0; // when that happened
-static bool chgSeen = false;       // true once a "lit" reading was seen
+static int chgMv = 0;              // not used any more (kept so old code that mentions it still compiles)
+static float chgBase = 0;          // slow baseline of the raw battery voltage
+static bool chgBaseOk = false;     // baseline has a first value
+static uint8_t chgUpCnt = 0;       // readings in a row that are CHG_JUMP_V above the baseline
+static uint8_t chgDnCnt = 0;       // readings in a row that are CHG_DROP_V below the baseline
+static uint8_t chgLowCnt = 0;      // readings in a row that end the "full" state
+static uint32_t chgFullSince = 0;  // when the voltage went >= CHG_FULL_V (0 = not now)
+static bool gChargerBoot = false;  // true: the board started because USB was connected (no button press)
+
+// The charge state survives a restart / crash in RTC memory (the pin test is wrong after those).
+#define CHG_RTC_MAGIC 0xC4A6E501UL
+RTC_NOINIT_ATTR static uint32_t rtcChgMagic;
+RTC_NOINIT_ATTR static uint8_t rtcChgState;
 
 // Optional hook: UI draws a goodbye screen before the board switches off.
 static void (*gBeforeOff)() = nullptr;
@@ -147,6 +180,11 @@ inline bool isFull() {
   return chgState == CHG_FULL;
 }
 
+// True when the board was started by the charger (no button press at boot).
+inline bool chargerOnBoot() {
+  return gChargerBoot;
+}
+
 // Average of many ADC readings; the lowest and highest are discarded (removes spikes).
 inline uint32_t batteryReadPinMv() {
   uint32_t sum = 0, mn = 0xFFFFFFFF, mx = 0;
@@ -161,6 +199,72 @@ inline uint32_t batteryReadPinMv() {
   return sum / (BAT_SAMPLES - 2);
 }
 
+// ---------- charger detection (from the battery voltage) -------------------------------
+
+// Change the charge state (and remember it in RTC memory for a restart).
+inline void chgSet(ChargeState s, const char* why) {
+  if (s != chgState) {
+    DBG(POWER, "charger: %s -> %s (%s)", chgState == CHG_CHARGING ? "CHARGING" : chgState == CHG_FULL ? "FULL" : "no USB",
+        s == CHG_CHARGING ? "CHARGING" : s == CHG_FULL ? "FULL" : "no USB", why);
+  }
+  chgState = s;
+  rtcChgState = (uint8_t)s;
+  rtcChgMagic = CHG_RTC_MAGIC;
+}
+
+// Called with every new RAW battery voltage (about once a second).
+inline void chargerDetect(float v, uint32_t now) {
+  if (!chgBaseOk) {                           // first reading: start the baseline here
+    chgBase = v;
+    chgBaseOk = true;
+    return;
+  }
+  float d = v - chgBase;                      // + = voltage went up, - = voltage went down
+
+  if (chgState == CHG_NONE) {
+    if (d >= CHG_JUMP_V) {                    // sudden rise: charger plugged in?
+      if (++chgUpCnt >= CHG_CONFIRM) {        // it stayed up for a few seconds => yes
+        chgUpCnt = 0;
+        chgFullSince = 0;
+        chgBase = v;
+        chgSet(CHG_CHARGING, "voltage jump");
+      }
+      return;                                 // baseline is FROZEN while a jump is pending
+    }
+    chgUpCnt = 0;
+    chgBase += d * CHG_BASE_NEW;              // slow follow (discharge is only a few mV per minute)
+    return;
+  }
+
+  // charging or full
+  if (d <= -CHG_DROP_V) {                     // sudden fall: charger removed?
+    if (++chgDnCnt >= CHG_CONFIRM) {
+      chgDnCnt = 0;
+      chgFullSince = 0;
+      chgBase = v;
+      chgSet(CHG_NONE, "voltage drop");
+    }
+    return;
+  }
+  chgDnCnt = 0;
+  chgBase += d * CHG_BASE_NEW;                // follow the slow rise of the charge
+
+  if (chgState == CHG_CHARGING) {
+    if (v >= CHG_FULL_V) {
+      if (!chgFullSince) chgFullSince = now ? now : 1;
+      else if (now - chgFullSince >= CHG_FULL_HOLD_MS) chgSet(CHG_FULL, "voltage high and steady");
+    } else chgFullSince = 0;
+  } else {                                    // CHG_FULL
+    if (v < CHG_FULL_V - CHG_FULL_HYST) {     // voltage sank: charger gone (or recharge not started yet)
+      if (++chgLowCnt >= CHG_CONFIRM) {
+        chgLowCnt = 0;
+        chgBase = v;
+        chgSet(CHG_NONE, "full ended");       // a new jump (recharge) sets CHARGING again
+      }
+    } else chgLowCnt = 0;
+  }
+}
+
 // Divider is connected directly to the battery (no MOSFET), so just read it every BAT_READ_MS.
 inline void batteryService(uint32_t now) {
   if (batLast != 0 && now - batLast < BAT_READ_MS) return;
@@ -169,47 +273,33 @@ inline void batteryService(uint32_t now) {
   // first value is taken as is; later values are smoothed
   vbat = (batLast == 0) ? v : vbat * (1.0f - BAT_FILTER_NEW) + v * BAT_FILTER_NEW;
   batLast = now ? now : 1;                          // never 0 (0 means "no reading yet")
-  DBG(POWER, "battery: pin=%.0fmV raw=%.3fV filtered=%.3fV -> %d%%", pinMv, v, vbat, batteryPercent());
-}
-
-// Read the charger pin often and decide: nothing / charging / full.
-// The charger LED blinks (1 s on, 1 s off) while charging, so:
-//   * a "lit" reading  => charging right now
-//   * LOW              => do NOT say "not charging" yet; keep the last state until the pin has
-//                         stayed LOW for CHG_LOSS_MS (longer than a whole blink period)
-inline void chargerService(uint32_t now) {
-  if (now - chgLast < CHG_SAMPLE_MS) return;
-  chgLast = now;
-  chgMv = analogReadMilliVolts(PIN_CHG);
-
-  if (chgMv >= CHG_MV_FULL_MIN) {             // pin is HIGH (some LED lit)
-    chgLastHighMv = chgMv;
-    chgLastHighAt = now;
-    chgSeen = true;
-  }
-
-  ChargeState s = CHG_NONE;
-  if (chgSeen && (now - chgLastHighAt) < CHG_LOSS_MS) {
-    // use the last lit voltage, so the dark half of the blink does not change the answer
-    s = (chgLastHighMv >= CHG_MV_CHARGING_MIN) ? CHG_CHARGING : CHG_FULL;
-  } else {
-    chgSeen = false;                          // LOW long enough: really not charging
-  }
-
-  if (s != chgState) {
-    DBG(POWER, "charger: %dmV -> %s", chgMv, s == CHG_CHARGING ? "CHARGING" : s == CHG_FULL ? "FULL" : "no USB");
-  }
-  chgState = s;
+  chargerDetect(v, now);                            // charger state from the RAW voltage
+  DBG(POWER, "battery: pin=%.0fmV raw=%.3fV filtered=%.3fV base=%.3fV -> %d%% (%s)", pinMv, v, vbat, chgBase,
+      batteryPercent(), chgState == CHG_CHARGING ? "charging" : chgState == CHG_FULL ? "full" : "battery");
 }
 
 // ---------- start / stop ---------------------------------------------------------------
 
 inline void powerBegin() {
+  // 1) Find out how we started. This must happen BEFORE we drive PIN_POWER.
+  esp_reset_reason_t rr = esp_reset_reason();
+  if (rr == ESP_RST_DEEPSLEEP) {
+    gChargerBoot = false;                     // woken by the button, but USB must be present (we only sleep on USB)
+    chgSet(CHG_CHARGING, "deep-sleep wake (USB present)");
+  } else if (rr != ESP_RST_POWERON && rr != ESP_RST_BROWNOUT && rtcChgMagic == CHG_RTC_MAGIC && rtcChgState <= CHG_FULL) {
+    gChargerBoot = false;                     // restart / crash: the pin test is not reliable, use the saved state
+    chgSet((ChargeState)rtcChgState, "restored after restart");
+  } else {                                    // real power-up: read the pin
+    pinMode(PIN_POWER, INPUT_PULLDOWN);
+    delay(2);                                 // let the wire settle
+    bool pressed = (digitalRead(PIN_POWER) == HIGH);
+    gChargerBoot = !pressed;                  // no button => the charger woke the board
+    chgSet(pressed ? CHG_NONE : CHG_CHARGING, pressed ? "boot: button pressed" : "boot: no button => USB");
+  }
+
   powerPinIdle();                             // hold the latch
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_BAT, ADC_11db); // measure up to ~3.1 V at the pin
-  analogSetPinAttenuation(PIN_CHG, ADC_11db);
-  pinMode(PIN_CHG, INPUT);
   pinMode(PIN_BAT, INPUT);
 }
 
@@ -259,6 +349,8 @@ inline void powerBegin() {
   if (setupActive() && lastBoardValid() && boardOccupancy() != gLb.occ) lastBoardInvalidate();   // setup was half done: the saved map is no longer true
   lastBoardFlush();                           // saved board survives the power cut
   storageSaveAll();
+  rtcChgState = (uint8_t)chgState;            // keep the charge state over the restart
+  rtcChgMagic = CHG_RTC_MAGIC;
   delay(100);
   ESP.restart();
   while (true) delay(1000);
@@ -269,8 +361,7 @@ inline void powerBegin() {
 inline void powerTick() {
   if (gPowerOffing) return;                   // shutting down: do not touch the pin
   uint32_t now = millis();
-  batteryService(now);
-  chargerService(now);
+  batteryService(now);                        // also runs the charger detection
 
   // Sample the button only every PWR_SAMPLE_MS (it costs a few microseconds each time).
   if (now - pwrLastSample < PWR_SAMPLE_MS) return;
